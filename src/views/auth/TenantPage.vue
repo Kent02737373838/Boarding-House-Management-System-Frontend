@@ -12,7 +12,8 @@ import RoomsGrid      from '@/components/layout/RoomsGrid.vue'
 import { getTenant, getLease, getPayments, getMaintenanceRequests, getMessages } from "../../services/tenantService";
 import { maintenanceService } from "../../services/maintenanceService";
 import { bookingService }      from '../../services/bookingService'
-import { managerRequestService } from '../../services/managerRequestService'
+import { managerRequestService, type ManagerRoleRequestItem } from '../../services/managerRequestService'
+import { authService } from '../../services/authService'
 import { notificationService, type NotificationItem } from '../../services/notificationService'
 import type { Room } from '../../models/room'
 import { isAvailable } from '../../models/room'
@@ -34,6 +35,8 @@ const activeSection = ref('home')
 
 const hasBooking    = ref(false)
 const managerBanner = ref('')
+const rejectedManagerReq = ref<ManagerRoleRequestItem | null>(null)
+const showLogoutConfirm  = ref(false)
 
 // ─── Room browsing state (Home section) ────────────────────────────────────────────────────
 const rooms          = ref<Room[]>([])
@@ -180,6 +183,10 @@ onMounted(async () => {
       if (approved) {
         managerBanner.value = 'Your Manager Application was approved! Log out and log back in to access the Manager Portal.'
       }
+      const rejected = managerReqs.value.requests?.find((r: any) => r.status === 'REJECTED')
+      if (rejected) {
+        rejectedManagerReq.value = rejected
+      }
     }
 
     // Load notifications (non-blocking)
@@ -252,8 +259,34 @@ function handleOpenMessage(id: number) {
 }
 
 function handleLogout() {
+  if (rejectedManagerReq.value) {
+    showLogoutConfirm.value = true
+    return
+  }
   auth.logout()
   router.push('/')
+}
+
+async function confirmLogoutDelete() {
+  showLogoutConfirm.value = false
+  try {
+    await authService.deleteAccount()
+  } catch (e: any) {
+    console.error('Failed to delete account:', e?.message)
+  }
+  auth.logout()
+  router.push('/')
+}
+
+function cancelLogoutDelete() {
+  showLogoutConfirm.value = false
+  auth.logout()
+  router.push('/')
+}
+
+function handleSwitchToManager() {
+  auth.logout()
+  window.location.href = '/'
 }
 
 function toggleNotifPanel() { showNotifPanel.value = !showNotifPanel.value }
@@ -307,27 +340,23 @@ onUnmounted(() => {
         <a :class="['navbar__link', activeSection === 'home' ? 'navbar__link--active' : '']"
            @click.prevent="scrollTo('home')" href="#">Home</a>
 
-        <a :class="['navbar__link', activeSection === 'my-room' ? 'navbar__link--active' : '', !hasBooking ? 'navbar__link--locked' : '']"
-           @click.prevent="scrollTo('my-room')" href="#"
-           :data-tooltip="!hasBooking ? 'Book a room first' : undefined">
+        <a :class="['navbar__link', !hasBooking ? 'navbar__link--locked' : '', activeSection === 'my-room' ? 'navbar__link--active' : '']"
+           @click.prevent="hasBooking && scrollTo('my-room')" href="#" data-tooltip="Locked — book a room first">
           My room <span v-if="!hasBooking" class="lock-icon">🔒</span>
         </a>
 
-        <a :class="['navbar__link', activeSection === 'payments' ? 'navbar__link--active' : '', !hasBooking ? 'navbar__link--locked' : '']"
-           @click.prevent="scrollTo('payments')" href="#"
-           :data-tooltip="!hasBooking ? 'Book a room first' : undefined">
+        <a :class="['navbar__link', !hasBooking ? 'navbar__link--locked' : '', activeSection === 'payments' ? 'navbar__link--active' : '']"
+           @click.prevent="hasBooking && scrollTo('payments')" href="#" data-tooltip="Locked — book a room first">
           Payments <span v-if="!hasBooking" class="lock-icon">🔒</span>
         </a>
 
-        <a :class="['navbar__link', activeSection === 'maintenance' ? 'navbar__link--active' : '', !hasBooking ? 'navbar__link--locked' : '']"
-           @click.prevent="scrollTo('maintenance')" href="#"
-           :data-tooltip="!hasBooking ? 'Book a room first' : undefined">
+        <a :class="['navbar__link', !hasBooking ? 'navbar__link--locked' : '', activeSection === 'maintenance' ? 'navbar__link--active' : '']"
+           @click.prevent="hasBooking && scrollTo('maintenance')" href="#" data-tooltip="Locked — book a room first">
           Maintenance <span v-if="!hasBooking" class="lock-icon">🔒</span>
         </a>
 
-        <a :class="['navbar__link', activeSection === 'messages' ? 'navbar__link--active' : '', !hasBooking ? 'navbar__link--locked' : '']"
-           @click.prevent="scrollTo('messages')" href="#"
-           :data-tooltip="!hasBooking ? 'Book a room first' : undefined">
+        <a :class="['navbar__link', !hasBooking ? 'navbar__link--locked' : '', activeSection === 'messages' ? 'navbar__link--active' : '']"
+           @click.prevent="hasBooking && scrollTo('messages')" href="#" data-tooltip="Locked — book a room first">
           Messages <span v-if="!hasBooking" class="lock-icon">🔒</span>
         </a>
       </div>
@@ -362,8 +391,31 @@ onUnmounted(() => {
 
     <!-- ── Manager approved banner ─────────────────────────────────────────── -->
     <div v-if="managerBanner" class="manager-banner">
-      🎉 {{ managerBanner }}
-      <button class="banner-logout" @click="handleLogout">Log out now</button>
+      <div class="banner-content">
+        <span class="banner-icon">🎉</span>
+        <div class="banner-text">
+          <strong>Congratulations!</strong> {{ managerBanner }}
+          <p class="banner-hint">You must log out and log back in to access the Manager Portal.</p>
+        </div>
+      </div>
+      <div class="banner-actions">
+        <button class="banner-switch" @click="handleSwitchToManager">Switch to Manager Portal →</button>
+        <button class="banner-dismiss" @click="managerBanner = ''">Dismiss</button>
+      </div>
+    </div>
+
+    <!-- ── Manager rejected banner ─────────────────────────────────────────── -->
+    <div v-if="rejectedManagerReq" class="manager-banner" style="background: linear-gradient(90deg, #ef4444, #dc2626);">
+      <div class="banner-content">
+        <span class="banner-icon">❌</span>
+        <div class="banner-text">
+          <strong>Manager Application Rejected</strong>
+          <p class="banner-hint">{{ rejectedManagerReq.review_notes ? rejectedManagerReq.review_notes : 'Your manager application was not approved. Your account will be deleted when you log out.' }}</p>
+        </div>
+      </div>
+      <div class="banner-actions">
+        <button class="banner-dismiss" @click="rejectedManagerReq = null">Dismiss</button>
+      </div>
     </div>
 
     <!-- ── HOME SECTION (room browsing) ───────────────────────────────────────── -->
@@ -415,7 +467,7 @@ onUnmounted(() => {
         <template v-else>
           <!-- MY ROOM -->
           <div v-show="activeSection === 'my-room'" id="my-room">
-            <header class="hero-dash">
+            <header class="hero-dash hero-dash--light">
               <div class="hero-dash__left">
                 <h1>{{ getGreeting() }}, {{ tenant?.name?.split(' ')[0] ?? username }}!</h1>
                 <p>Here's your boarding house overview for today.</p>
@@ -423,11 +475,11 @@ onUnmounted(() => {
               <div class="hero-dash__stats">
                 <div class="hero-dash__stat">
                   <span class="stat-label">Your room</span>
-                  <span class="stat-value">{{ tenant?.room_number ?? tenant?.room ?? '—' }}</span>
+                  <span class="stat-value stat-value--purple">{{ tenant?.room_number ?? tenant?.room ?? '—' }}</span>
                 </div>
                 <div class="hero-dash__stat">
                   <span class="stat-label">Floor</span>
-                  <span class="stat-value">{{ tenant?.floor_level ?? tenant?.floor ?? '—' }}</span>
+                  <span class="stat-value stat-value--purple">{{ tenant?.floor_level ?? tenant?.floor ?? '—' }}</span>
                 </div>
                 <div class="hero-dash__stat">
                   <span class="stat-label">Status</span>
@@ -436,13 +488,22 @@ onUnmounted(() => {
               </div>
             </header>
             <main class="content">
-              <section class="section--full"><LeaseCard v-if="lease" :lease="lease" /></section>
-              <section class="section--two-col">
-                <PaymentsCard v-if="payments.length" :payments="payments" @pay-now="handlePayNow" />
-                <MaintenanceCard :requests="maintenanceRequests" @submit-new="handleSubmitMaintenance" />
+              <section class="my-room-grid">
+                <div class="my-room-col my-room-col--lease">
+                  <LeaseCard v-if="lease" :lease="lease" />
+                  <div v-else class="empty-section">No lease information found.</div>
+                </div>
+                <div class="my-room-col">
+                  <PaymentsCard v-if="payments.length" :payments="payments" @pay-now="handlePayNow" />
+                  <div v-else class="empty-section">No payment records.</div>
+                </div>
+                <div class="my-room-col">
+                  <MaintenanceCard :requests="maintenanceRequests" @submit-new="handleSubmitMaintenance" />
+                </div>
               </section>
               <section class="section--full">
                 <MessagesCard v-if="messages.length" :messages="messages" @open-message="handleOpenMessage" />
+                <div v-else class="empty-section">No messages yet.</div>
               </section>
             </main>
           </div>
@@ -589,6 +650,32 @@ onUnmounted(() => {
       </div>
     </Teleport>
 
+    <!-- ── Logout Confirmation (rejected manager request) ─────────────────── -->
+    <Teleport to="body">
+      <div v-if="showLogoutConfirm" class="modal-overlay" @click.self="cancelLogoutDelete">
+        <div class="modal-card" style="max-width: 420px; text-align: center;">
+          <button class="modal-close" @click="cancelLogoutDelete">✕</button>
+          <div class="modal-header" style="align-items: center;">
+            <div style="font-size: 40px; margin-bottom: 8px;">⚠️</div>
+            <h2>Account Will Be Deleted</h2>
+            <p class="modal-sub">Your manager application was rejected.</p>
+          </div>
+          <p style="font-size: 14px; color: #4b5563; line-height: 1.5; margin: 8px 0;">
+            This account will not be active anymore and it has been rejected for manager request.
+            Logging out will permanently delete your account.
+          </p>
+          <div style="display: flex; gap: 10px; margin-top: 8px;">
+            <button class="btn-primary" style="background: linear-gradient(90deg, #ef4444, #dc2626); flex: 1;" @click="confirmLogoutDelete">
+              Delete Account &amp; Logout
+            </button>
+            <button class="btn-outline" style="flex: 1; padding: 12px; border-radius: 999px; border: 1px solid #e0ddf7; background: #fff; cursor: pointer; font-weight: 600; color: #374151;" @click="cancelLogoutDelete">
+              Just Logout
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
   </div>
 </template>
 
@@ -683,15 +770,35 @@ onUnmounted(() => {
 /* ── Manager banner ────────────────────────────────────────────────── */
 .manager-banner {
   background: linear-gradient(90deg, #4ade80, #22c55e);
-  color: #fff; font-size: 13px; font-weight: 600;
-  padding: 10px 24px; display: flex; align-items: center; justify-content: center; gap: 12px;
+  color: #fff;
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
 }
-.banner-logout {
-  background: rgba(255,255,255,.25); border: 1px solid rgba(255,255,255,.5);
-  color: #fff; font-size: 12px; font-weight: 700; padding: 4px 12px;
-  border-radius: 20px; cursor: pointer; transition: background .15s;
+.banner-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
-.banner-logout:hover { background: rgba(255,255,255,.4); }
+.banner-icon { font-size: 24px; }
+.banner-text { font-size: 13px; font-weight: 600; line-height: 1.4; }
+.banner-hint { font-size: 12px; font-weight: 500; opacity: .9; margin: 2px 0 0; }
+.banner-actions { display: flex; align-items: center; gap: 10px; }
+.banner-switch {
+  background: #fff; color: #15803d; font-size: 12px; font-weight: 700;
+  padding: 7px 16px; border-radius: 20px; border: none; cursor: pointer;
+  transition: transform .1s, box-shadow .15s;
+}
+.banner-switch:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.12); }
+.banner-dismiss {
+  background: rgba(255,255,255,.2); color: #fff; font-size: 12px; font-weight: 600;
+  padding: 6px 12px; border-radius: 20px; border: 1px solid rgba(255,255,255,.4);
+  cursor: pointer; transition: background .15s;
+}
+.banner-dismiss:hover { background: rgba(255,255,255,.35); }
 
 /* ── Main content (home section grid) ────────────────────────────── */
 .main-content { display: flex; gap: 32px; padding: 40px 80px 80px; position: relative; }
@@ -713,6 +820,30 @@ onUnmounted(() => {
 .stat-label { font-size: 11px; color: #a5b4fc; text-transform: uppercase; letter-spacing: .04em; }
 .stat-value { font-size: 18px; font-weight: 700; color: #fff; }
 .stat-value--green { font-size: 13px; color: #4ade80; }
+
+/* Light hero (matches screenshot) */
+.hero-dash--light {
+  background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+  border-bottom: 1px solid #e0ddf7;
+}
+.hero-dash--light .hero-dash__left h1 { color: #1e1b4b; }
+.hero-dash--light .hero-dash__left p  { color: #6b7280; }
+.hero-dash--light .hero-dash__stat {
+  background: #fff; border: 1px solid #e0ddf7;
+  box-shadow: 0 2px 8px rgba(129,140,248,.1);
+}
+.hero-dash--light .stat-label { color: #9ca3af; }
+.hero-dash--light .stat-value { color: #4c1d95; }
+.hero-dash--light .stat-value--green { color: #16a34a; }
+
+/* My Room 3-column grid */
+.my-room-grid {
+  display: grid;
+  grid-template-columns: 1.6fr 1fr 1fr;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+.my-room-col { min-width: 0; }
 
 /* ── Locked screen ────────────────────────────────────────────────── */
 .locked-screen {
@@ -793,10 +924,18 @@ onUnmounted(() => {
 }
 
 /* ── Responsive ──────────────────────────────────────────────── */
+@media (max-width: 1024px) {
+  .my-room-grid { grid-template-columns: 1fr 1fr; }
+  .my-room-col--lease { grid-column: 1 / -1; }
+}
+
 @media (max-width: 768px) {
   .section--two-col {
     grid-template-columns: 1fr;
   }
+
+  .my-room-grid { grid-template-columns: 1fr; }
+  .my-room-col--lease { grid-column: auto; }
 
   .hero-dash {
     flex-direction: column;

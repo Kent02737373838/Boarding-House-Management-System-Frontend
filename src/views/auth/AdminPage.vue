@@ -62,7 +62,7 @@ async function approveManagerRequest(id: string) {
   try {
     await managerRequestService.review(id, { status: 'APPROVED' })
     closeManagerReqModal()
-    await fetchManagerRequests()
+    await Promise.all([fetchManagerRequests(), fetchAdminData()])
   } catch (e: any) { error.value = e?.message ?? 'Failed to approve request.' }
 }
 
@@ -71,7 +71,7 @@ async function rejectManagerRequest(id: string) {
   try {
     await managerRequestService.review(id, { status: 'REJECTED', review_notes: rejectReason.value || 'Rejected by admin' })
     closeManagerReqModal()
-    await fetchManagerRequests()
+    await Promise.all([fetchManagerRequests(), fetchAdminData()])
   } catch (e: any) { error.value = e?.message ?? 'Failed to reject request.' }
 }
 
@@ -365,9 +365,7 @@ onMounted(() => {
                   <td>{{ r.address }}</td>
                   <td><span class="badge" :class="r.status.toLowerCase()">{{ r.status }}</span></td>
                   <td style="display:flex;gap:6px;">
-                    <button class="action-btn view"    @click="viewManagerRequest(r)">View</button>
-                    <button class="action-btn approve" @click="approveManagerRequest(r.id)">Approve</button>
-                    <button class="action-btn reject"  @click="rejectManagerRequest(r.id)">Reject</button>
+                    <button class="action-btn view" @click="viewManagerRequest(r)">View</button>
                   </td>
                 </tr>
               </tbody>

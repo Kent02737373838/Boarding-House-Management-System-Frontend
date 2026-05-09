@@ -33,6 +33,7 @@ const leases         = ref<ManagerLease[]>([])
 const payments       = ref<ManagerPayment[]>([])
 const maintenance    = ref<ManagerMaintenance[]>([])
 const bookings           = ref<BookingItem[]>([])
+const approvedBookings   = ref<BookingItem[]>([])
 const viewingBooking     = ref<BookingItem | null>(null)
 const confirmRejectId    = ref('')
 const rejectReason       = ref('')
@@ -52,6 +53,9 @@ const roomForm = ref<RoomCreateRequest>({
   floor_level:         undefined,
   room_type:           'SINGLE',
   description:         '',
+  property_name:       '',
+  location:            '',
+  address:             '',
   max_occupants:       1,
   monthly_rate:        0,
   deposit_multiplier:  2,
@@ -71,6 +75,9 @@ function openAddRoom() {
     floor_level:        undefined,
     room_type:          'SINGLE',
     description:        '',
+    property_name:      '',
+    location:           '',
+    address:            '',
     max_occupants:      1,
     monthly_rate:       0,
     deposit_multiplier: 2,
@@ -103,11 +110,14 @@ async function submitAddRoom() {
   try {
     const payload: RoomCreateRequest = {
       ...roomForm.value,
-      room_number:  roomForm.value.room_number.trim(),
-      description:  roomForm.value.description?.trim() || undefined,
-      amenities:    amenityList.value.length > 0 ? [...amenityList.value] : undefined,
-      dimension:    (roomForm.value.dimension?.length_sqm || roomForm.value.dimension?.width_sqm)
-                      ? roomForm.value.dimension : undefined,
+      room_number:   roomForm.value.room_number.trim(),
+      description:   roomForm.value.description?.trim() || undefined,
+      property_name: roomForm.value.property_name?.trim() || undefined,
+      location:      roomForm.value.location?.trim() || undefined,
+      address:       roomForm.value.address?.trim() || undefined,
+      amenities:     amenityList.value.length > 0 ? [...amenityList.value] : undefined,
+      dimension:     (roomForm.value.dimension?.length_sqm || roomForm.value.dimension?.width_sqm)
+                       ? roomForm.value.dimension : undefined,
     }
     await roomService.create(payload)
     showAddRoomModal.value = false
@@ -119,7 +129,19 @@ async function submitAddRoom() {
   }
 }
 
-async function removeRoom(id: string, roomNumber: string) {
+async function removeRoom(id: string, roomNumber: string, roomStatus: string) {
+  const isOccupied = roomStatus === 'OCCUPIED' || roomStatus === 'RESERVED'
+  if (isOccupied) {
+    if (!window.confirm(`Unassign tenant from room ${roomNumber} and mark it as vacant?`)) return
+    try {
+      await roomService.unassignRoom(id)
+      await loadManagerData()
+    } catch (e: any) {
+      error.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to unassign tenant from room.'
+    }
+    return
+  }
+  // Vacant room — offer to delete (admin only) or just confirm
   if (!window.confirm(`Remove room ${roomNumber}? This cannot be undone.`)) return
   try {
     await roomService.deleteRoom(id)
@@ -152,14 +174,62 @@ async function setRoomVacant(id: string) {
   }
 }
 
+const activeTenants = computed(() => tenants.value.filter(t => t.status === 'ACTIVE'))
 const filteredTenants = computed(() =>
   tenantSearch.value
-    ? tenants.value.filter(t =>
+    ? activeTenants.value.filter(t =>
         t.full_name.toLowerCase().includes(tenantSearch.value.toLowerCase()) ||
         t.email.toLowerCase().includes(tenantSearch.value.toLowerCase()) ||
         t.phone.includes(tenantSearch.value))
-    : tenants.value
+    : activeTenants.value
 )
+
+// Tenants in reserved rooms come from APPROVED bookings
+interface ReservedTenant {
+  id: string
+  full_name: string
+  email: string
+  phone: string
+  room_id?: string
+  room_number?: string
+  status: 'RESERVED'
+  outstanding_balance: number
+  created_at: string
+  is_reserved: true
+}
+
+const reservedTenants = computed<ReservedTenant[]>(() => {
+  const activeRoomIds = new Set(
+    rooms.value
+      .filter(r => r.status === 'RESERVED' || r.status === 'OCCUPIED')
+      .map(r => r.id)
+  )
+  return approvedBookings.value
+    .filter(b => activeRoomIds.has(b.room_id))
+    .map(b => ({
+      id: b.id,
+      full_name: b.full_name,
+      email: b.email,
+      phone: b.phone,
+      room_id: b.room_id,
+      room_number: b.room_number,
+      status: 'RESERVED' as const,
+      outstanding_balance: 0,
+      created_at: b.created_at,
+      is_reserved: true as const,
+    }))
+})
+
+const allTenantsDisplay = computed(() => {
+  const regular = filteredTenants.value.map(t => ({ ...t, is_reserved: false as const }))
+  const reserved = reservedTenants.value.filter(r =>
+    !tenantSearch.value ||
+    r.full_name.toLowerCase().includes(tenantSearch.value.toLowerCase()) ||
+    r.email.toLowerCase().includes(tenantSearch.value.toLowerCase()) ||
+    r.phone.includes(tenantSearch.value)
+  )
+  return [...regular, ...reserved]
+})
 
 const filteredRooms = computed(() =>
   roomSearch.value
@@ -168,7 +238,7 @@ const filteredRooms = computed(() =>
 )
 
 const sidebarBadges = computed<Record<string, number>>(() => ({
-  tenants:     tenantStats.value?.total ?? 0,
+  tenants:     (tenantStats.value?.total ?? 0) + reservedTenants.value.length,
   payments:    paymentStats.value?.unpaid_count ?? 0,
   maintenance: (dashboard.value?.maintenance?.submitted ?? 0) + (dashboard.value?.maintenance?.in_progress ?? 0),
 }))
@@ -265,6 +335,9 @@ async function loadManagerData() {
     if (bookingsRes.status === 'fulfilled') bookings.value      = bookingsRes.value.bookings ?? []
     if (statsRes.status === 'fulfilled')    paymentStats.value  = statsRes.value
     if (notifRes.status === 'fulfilled')    notifications.value = notifRes.value
+
+    const approvedRes = await bookingService.listAll({ status: 'APPROVED', limit: 50 })
+    approvedBookings.value = approvedRes.bookings ?? []
 
     const [tListRes, tStatsRes] = await Promise.allSettled([
       tenantService.getAll({ limit: 100 }),
@@ -474,13 +547,12 @@ onMounted(() => { void loadManagerData() })
             <table class="ptable">
               <thead><tr><th>Name</th><th>Room</th><th>Date</th><th>Actions</th></tr></thead>
               <tbody>
-                <tr v-for="b in bookings.slice(0, 3)" :key="b.id">
+                <tr v-for="b in bookings.slice(0, 3)" :key="b.id" style="cursor:pointer" @click="viewBooking(b)">
                   <td>{{ b.full_name }}</td>
                   <td>{{ b.room_number ?? b.room_id.slice(0,8) }}</td>
                   <td>{{ formatDate(b.created_at) }}</td>
                   <td>
-                    <button class="action-btn approve" @click="approveBooking(b.id)">Approve</button>
-                    <button class="action-btn reject"  @click="rejectBooking(b.id)">Reject</button>
+                    <button class="action-btn view" @click.stop="viewBooking(b)">View</button>
                   </td>
                 </tr>
               </tbody>
@@ -493,7 +565,7 @@ onMounted(() => { void loadManagerData() })
           <div class="page-hdr">
             <div>
               <h1 class="page-title">Tenants</h1>
-              <p class="page-sub">{{ tenantStats?.active ?? 0 }} active · {{ tenantStats?.pending ?? 0 }} pending</p>
+              <p class="page-sub">{{ tenantStats?.active ?? 0 }} active · {{ tenantStats?.pending ?? 0 }} pending · {{ reservedTenants.length }} reserved</p>
             </div>
           </div>
           <div class="panel">
@@ -504,16 +576,19 @@ onMounted(() => { void loadManagerData() })
               <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Room</th><th>Status</th><th>Balance</th><th>Since</th></tr></thead>
               <tbody>
                 <tr v-if="loading"><td colspan="7" class="td-muted">Loading…</td></tr>
-                <tr v-for="t in filteredTenants" :key="t.id">
+                <tr v-for="t in allTenantsDisplay" :key="t.id + (t.is_reserved ? '-r' : '')">
                   <td class="td-name">{{ t.full_name }}</td>
                   <td class="td-muted">{{ t.email }}</td>
                   <td>{{ t.phone }}</td>
-                  <td>{{ t.room_id ? t.room_id.slice(0,8) : '—' }}</td>
-                  <td><span class="badge" :class="t.status === 'ACTIVE' ? 'badge-paid' : t.status === 'PENDING' ? 'badge-pending' : 'badge-unpaid'">{{ t.status }}</span></td>
+                  <td>{{ t.room_number ?? (t.room_id ? t.room_id.slice(0,8) : '—') }}</td>
+                  <td>
+                    <span v-if="'is_reserved' in t && t.is_reserved" class="badge badge-pending">Reserved</span>
+                    <span v-else class="badge" :class="t.status === 'ACTIVE' ? 'badge-paid' : t.status === 'PENDING' ? 'badge-pending' : 'badge-unpaid'">{{ t.status }}</span>
+                  </td>
                   <td :class="t.outstanding_balance > 0 ? 'td-danger' : ''">{{ formatMoney(t.outstanding_balance) }}</td>
                   <td class="td-muted">{{ formatDate(t.created_at) }}</td>
                 </tr>
-                <tr v-if="!loading && filteredTenants.length === 0"><td colspan="7" class="td-muted">No tenants found.</td></tr>
+                <tr v-if="!loading && allTenantsDisplay.length === 0"><td colspan="7" class="td-muted">No tenants found.</td></tr>
               </tbody>
             </table>
           </div>
@@ -535,13 +610,14 @@ onMounted(() => { void loadManagerData() })
               <input v-model="roomSearch" type="search" class="search-input" placeholder="Search by room number or status…">
             </div>
             <table class="ptable full">
-              <thead><tr><th>Room #</th><th>Status</th><th>Occupants</th><th>Monthly Rent</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Room #</th><th>Status</th><th>Reserved By</th><th>Occupants</th><th>Monthly Rent</th><th>Actions</th></tr></thead>
               <tbody>
-                <tr v-if="loading"><td colspan="5" class="td-muted">Loading…</td></tr>
+                <tr v-if="loading"><td colspan="6" class="td-muted">Loading…</td></tr>
                 <tr v-for="r in filteredRooms" :key="r.id">
                   <td class="td-name">{{ r.room_number }}</td>
                   <td><span class="badge" :class="r.status === 'VACANT' ? 'badge-paid' : r.status === 'OCCUPIED' ? 'badge-inprogress' : r.status === 'MAINTENANCE' ? 'badge-partial' : 'badge-pending'">{{ r.status }}</span></td>
-                  <td>{{ r.current_occupants ?? 0 }} / {{ r.capacity ?? '—' }}</td>
+                  <td class="td-muted">{{ r.status === 'OCCUPIED' || r.status === 'RESERVED' ? (tenants.find(t => t.room_id === r.id)?.full_name ?? approvedBookings.find(b => b.room_id === r.id)?.full_name ?? '—') : '—' }}</td>
+                  <td>{{ r.current_occupants ?? 0 }} / {{ r.max_occupants ?? '—' }}</td>
                   <td>{{ formatMoney(r.monthly_rent) }}</td>
                   <td class="td-actions">
                     <button
@@ -558,12 +634,12 @@ onMounted(() => { void loadManagerData() })
                     >Set Maintenance</button>
                     <button
                       class="action-btn reject"
-                      title="Permanently delete room (admin only)"
-                      @click="removeRoom(r.id, r.room_number)"
-                    >Remove</button>
+                      :title="r.status === 'OCCUPIED' || r.status === 'RESERVED' ? 'Unassign tenant from this room' : 'Permanently delete room (admin only)'"
+                      @click="removeRoom(r.id, r.room_number, r.status)"
+                    >{{ r.status === 'OCCUPIED' || r.status === 'RESERVED' ? 'Unassign' : 'Remove' }}</button>
                   </td>
                 </tr>
-                <tr v-if="!loading && filteredRooms.length === 0"><td colspan="5" class="td-muted">No rooms found.</td></tr>
+                <tr v-if="!loading && filteredRooms.length === 0"><td colspan="6" class="td-muted">No rooms found.</td></tr>
               </tbody>
             </table>
           </div>
@@ -707,7 +783,7 @@ onMounted(() => { void loadManagerData() })
               <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>Room</th><th>Move-in</th><th>Date</th><th>Actions</th></tr></thead>
               <tbody>
                 <tr v-if="loading"><td colspan="7" class="td-muted">Loading…</td></tr>
-                <tr v-for="b in bookings" :key="b.id">
+                <tr v-for="b in bookings" :key="b.id" style="cursor:pointer" @click="viewBooking(b)">
                   <td class="td-name">{{ b.full_name }}</td>
                   <td class="td-muted">{{ b.email }}</td>
                   <td>{{ b.phone }}</td>
@@ -715,8 +791,7 @@ onMounted(() => { void loadManagerData() })
                   <td>{{ formatDate(b.desired_move_in_date) }}</td>
                   <td>{{ formatDate(b.created_at) }}</td>
                   <td>
-                    <button class="action-btn approve" @click="approveBooking(b.id)">Approve</button>
-                    <button class="action-btn reject"  @click="rejectBooking(b.id)">Reject</button>
+                    <button class="action-btn view" @click.stop="viewBooking(b)">View</button>
                   </td>
                 </tr>
                 <tr v-if="!loading && bookings.length === 0"><td colspan="7" class="td-muted">No pending applications.</td></tr>
@@ -805,6 +880,22 @@ onMounted(() => { void loadManagerData() })
             <div class="form-group full">
               <label>Description</label>
               <textarea v-model="roomForm.description" class="form-textarea" rows="2" placeholder="Optional room description…"></textarea>
+            </div>
+
+            <div class="form-group full">
+              <label>Property Name</label>
+              <input v-model="roomForm.property_name" type="text" placeholder="e.g. Sun Residences" class="form-input" />
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label>Location / City</label>
+                <input v-model="roomForm.location" type="text" placeholder="e.g. Quezon City" class="form-input" />
+              </div>
+              <div class="form-group">
+                <label>Full Address</label>
+                <input v-model="roomForm.address" type="text" placeholder="Street, Barangay" class="form-input" />
+              </div>
             </div>
 
             <div class="form-row">
@@ -968,6 +1059,7 @@ onMounted(() => { void loadManagerData() })
 .action-btn.approve { background: #dcfce7; color: #166534; }
 .action-btn.reject  { background: #fee2e2; color: #991b1b; }
 .action-btn.outline { background: #f3f0fb; color: #6b7280; border: 1px solid #e0ddf7; }
+.action-btn.view    { background: #eff6ff; color: #2563eb; border-radius: 8px; padding: 5px 14px; font-size: 12px; }
 
 /* ── Table action cell ── */
 .td-actions { white-space: nowrap; }
@@ -1046,7 +1138,6 @@ onMounted(() => { void loadManagerData() })
 /* ── Modal transition ── */
 .modal-fade-enter-active, .modal-fade-leave-active { transition: opacity .18s ease; }
 .modal-fade-enter-from, .modal-fade-leave-to { opacity: 0; }
-.action-btn.view { background: #eff6ff; color: #2563eb; }
 </style>
 
 <style>

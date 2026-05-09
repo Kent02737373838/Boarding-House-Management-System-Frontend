@@ -3,7 +3,7 @@ import type { Room } from '../../models/room'
 import {
   RoomStatus,
   CARD_BG, ICON_COLOR, STATUS_COLOR, STATUS_LABEL, FLOOR_LABEL, TYPE_LABEL,
-  formatPrice, moveInTotal, requiredDeposit,
+  formatPrice, moveInTotal, requiredDeposit, requiredAdvance,
 } from '../../models/room'
 import type { ManagerInfo } from '../../models/room'
 
@@ -39,11 +39,22 @@ const emit = defineEmits<{ (e: 'inquire', room: Room): void }>()
 
     <!-- Info -->
     <div class="room-info">
+      <!-- Property Header -->
+      <div v-if="room.property_name || room.location" class="property-header">
+        <div v-if="room.property_name" class="property-name">{{ room.property_name }}</div>
+        <div v-if="room.location" class="property-location">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg>
+          {{ room.location }}
+        </div>
+      </div>
+
+      <!-- Room Title -->
       <div class="room-name">
         Room {{ room.room_number }}
         <span class="type-tag">{{ TYPE_LABEL[room.room_type] }}</span>
       </div>
 
+      <!-- Room Meta -->
       <div class="room-meta">
         <span v-if="room.floor_level" class="meta-item">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -51,11 +62,35 @@ const emit = defineEmits<{ (e: 'inquire', room: Room): void }>()
           </svg>
           {{ FLOOR_LABEL[room.floor_level] }}
         </span>
-        <span v-if="room.dimension?.length_sqm && room.dimension?.width_sqm" class="meta-item">
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M3 3h18v18H3z"/>
-          </svg>
-          {{ (room.dimension.length_sqm * room.dimension.width_sqm).toFixed(1) }} sqm
+        <span class="meta-item">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/></svg>
+          Max {{ room.max_occupants }}
+        </span>
+      </div>
+
+      <!-- Description -->
+      <div v-if="room.description" class="room-description">
+        {{ room.description }}
+      </div>
+
+      <!-- Full Address -->
+      <div v-if="room.address" class="room-address">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        {{ room.address }}
+      </div>
+
+      <!-- Dimensions -->
+      <div v-if="room.dimension?.length_sqm || room.dimension?.width_sqm" class="dimension-row">
+        <span v-if="room.dimension.length_sqm" class="dim-item">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/></svg>
+          Length: {{ room.dimension.length_sqm }} sqm
+        </span>
+        <span v-if="room.dimension.width_sqm" class="dim-item">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/></svg>
+          Width: {{ room.dimension.width_sqm }} sqm
+        </span>
+        <span v-if="room.dimension.length_sqm && room.dimension.width_sqm" class="dim-item dim-area">
+          Area: {{ (room.dimension.length_sqm * room.dimension.width_sqm).toFixed(1) }} sqm
         </span>
       </div>
 
@@ -90,7 +125,7 @@ const emit = defineEmits<{ (e: 'inquire', room: Room): void }>()
         </div>
       </div>
 
-      <!-- Move-in breakdown -->
+      <!-- Financial breakdown -->
       <div class="price-breakdown">
         <div class="price-row main">
           <span>Monthly rent</span>
@@ -99,6 +134,10 @@ const emit = defineEmits<{ (e: 'inquire', room: Room): void }>()
         <div class="price-row sub">
           <span>Deposit (×{{ room.deposit_multiplier }})</span>
           <span>{{ formatPrice(requiredDeposit(room)) }}</span>
+        </div>
+        <div class="price-row sub">
+          <span>Advance (×{{ room.advance_multiplier }})</span>
+          <span>{{ formatPrice(requiredAdvance(room)) }}</span>
         </div>
         <div class="price-divider"></div>
         <div class="price-row move-in">
@@ -166,6 +205,47 @@ const emit = defineEmits<{ (e: 'inquire', room: Room): void }>()
 .meta-item {
   display: flex; align-items: center; gap: 4px;
   font-size: 11px; color: #9ca3af;
+}
+
+/* Property header */
+.property-header {
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+}
+.property-name {
+  font-size: 13px; font-weight: 700; color: #3730a3;
+}
+.property-location {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; color: #6b7280; margin-top: 2px;
+}
+
+/* Description & Address */
+.room-description {
+  font-size: 12px; color: #4b5563; line-height: 1.5;
+  margin-bottom: 10px; padding: 8px; border-radius: 8px;
+  background: rgba(174,104,250,0.05);
+}
+.room-address {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 11px; color: #6b7280; line-height: 1.4;
+  margin-bottom: 10px;
+}
+
+/* Dimensions */
+.dimension-row {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin-bottom: 10px;
+}
+.dim-item {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; color: #6b7280;
+  background: rgba(0,0,0,0.04); padding: 3px 8px;
+  border-radius: 6px;
+}
+.dim-area {
+  color: #4b5563; font-weight: 600;
 }
 
 .amenity-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 14px; }
