@@ -417,13 +417,24 @@ function chooseManager() {
   showRoleModal.value = false
   managerAppError.value   = ''
   managerAppSuccess.value = ''
-  Object.assign(managerAppForm, { property_name: '', location: '', address: '', room_count: 1, description: '' })
+  managerAppForm.property_name = ''
+  managerAppForm.location      = ''
+  managerAppForm.address       = ''
+  managerAppForm.room_count    = 1
+  managerAppForm.description   = ''
   showManagerAppModal.value = true
 }
 
 async function submitManagerApp() {
   managerAppError.value = ''; managerAppLoading.value = true
   try {
+    // Validate room_count is a valid integer >= 1
+    const roomCount = Number(managerAppForm.room_count)
+    if (!Number.isFinite(roomCount) || roomCount < 1 || !Number.isInteger(roomCount)) {
+      managerAppError.value = 'Please enter a valid number of rooms (minimum 1).'
+      managerAppLoading.value = false
+      return
+    }
     // 1. Register (deferred — not called until user completes this form)
     await authService.register(registerForm)
     // 2. Auto-login with just-registered credentials
@@ -444,7 +455,7 @@ async function submitManagerApp() {
       property_name: managerAppForm.property_name,
       location:      managerAppForm.location,
       address:       managerAppForm.address,
-      room_count:    managerAppForm.room_count,
+      room_count:    roomCount,
       description:   managerAppForm.description || undefined,
     })
     managerAppSuccess.value = res.message || 'Application submitted! Admin will review it.'
@@ -776,7 +787,7 @@ const handleGoogleRegister = () => { window.location.href = 'http://localhost:80
             </div>
             <div class="field">
               <label>Number of Rooms</label>
-              <input v-model.number="managerAppForm.room_count" type="number" min="1" class="input" />
+              <input v-model.number="managerAppForm.room_count" type="number" min="1" step="1" class="input" />
             </div>
             <div class="field">
               <label>Description <span style="color:#9ca3af;font-weight:400">(optional)</span></label>

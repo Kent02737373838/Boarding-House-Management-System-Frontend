@@ -64,6 +64,11 @@ export interface Room {
   room_type:       RoomType
   description?:    string
 
+  // Property Info
+  property_name?: string
+  location?:      string
+  address?:       string
+
   // Capacity
   max_occupants:     number
   current_occupants: number
