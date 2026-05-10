@@ -3,14 +3,17 @@ import BaseCard from './Card.vue'
 
 export interface Message {
   id: number
+  rawId?: string
+  threadId?: string
   senderName: string
+  subject?: string
   preview: string
-  time: string   // e.g. '2h ago', 'Yesterday', 'Mar 18'
+  time: string
   isUnread?: boolean
 }
 
 defineProps<{ messages: Message[] }>()
-const emit = defineEmits<{ openMessage: [id: number] }>()
+const emit = defineEmits<{ openMessage: [id: number]; viewAll: [] }>()
 
 function initials(name: string) {
   return name
@@ -26,7 +29,7 @@ const textColors   = ['#4f6ef7', '#1a8a52', '#e74c3c', '#b07d0a']
 </script>
 
 <template>
-  <BaseCard title="Messages from management" link-text="View all" link-href="#">
+  <BaseCard title="Messages from management" link-text="View all" @link-click="emit('viewAll')">
     <div
       v-for="(msg, index) in messages"
       :key="msg.id"

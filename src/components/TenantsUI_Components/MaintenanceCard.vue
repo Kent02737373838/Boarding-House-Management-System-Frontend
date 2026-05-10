@@ -9,7 +9,7 @@ export interface MaintenanceRequest {
 }
 
 defineProps<{ requests: MaintenanceRequest[] }>()
-const emit = defineEmits<{ submitNew: [] }>()
+const emit = defineEmits<{ submitNew: []; viewAll: [] }>()
 
 const statusColor: Record<string, string> = {
   'In progress': 'amber',
@@ -19,7 +19,7 @@ const statusColor: Record<string, string> = {
 </script>
 
 <template>
-  <BaseCard title="Maintenance requests" link-text="View all" link-href="#">
+  <BaseCard title="Maintenance requests" link-text="View all" @link-click="emit('viewAll')">
     <div
       v-for="req in requests"
       :key="req.id"

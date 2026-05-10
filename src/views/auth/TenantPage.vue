@@ -9,14 +9,14 @@ import Hero           from '@/components/layout/Hero.vue'
 import FilterBar      from '@/components/layout/FilterBar.vue'
 import SidebarFilters from '@/components/layout/SidebarFilters.vue'
 import RoomsGrid      from '@/components/layout/RoomsGrid.vue'
-import { getTenant, getLease, getPayments, getMaintenanceRequests, getMessages } from "../../services/tenantService";
+import { getTenant, getRoom, getLease, getPayments, getMaintenanceRequests, getMessages, markThreadRead, markNotificationRead, initiatePaypalPayment } from "../../services/tenantService";
 import { maintenanceService } from "../../services/maintenanceService";
 import { bookingService }      from '../../services/bookingService'
 import { managerRequestService, type ManagerRoleRequestItem } from '../../services/managerRequestService'
 import { authService } from '../../services/authService'
 import { notificationService, type NotificationItem } from '../../services/notificationService'
 import type { Room } from '../../models/room'
-import { isAvailable } from '../../models/room'
+import { isAvailable, FLOOR_LABEL, TYPE_LABEL } from '../../models/room'
 import router from "../../router";
 
 const auth = useAuthStore()
@@ -25,6 +25,7 @@ const username = auth.user?.username ?? 'Tenant'
 const initials = username.slice(0, 2).toUpperCase()
 
 const tenant = ref<any>(null);
+const room   = ref<any>(null);
 const lease = ref<any>(null);
 const payments = ref<any[]>([]);
 const maintenanceRequests = ref<any[]>([]);
@@ -33,10 +34,127 @@ const loading = ref(true)
 const error = ref('')     
 const activeSection = ref('home')
 
+function floorShort(fl: string): string {
+  const map: Record<string, string> = {
+    GROUND: 'Ground', SECOND: '2nd', THIRD: '3rd', FOURTH: '4th', FIFTH: '5th',
+  }
+  return map[fl] ?? fl
+}
+
+// ─── Data shape transformers (backend → component props) ──────────────────────
+
+function fmtDate(d: string) {
+  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+const leaseForCard = computed(() => {
+  if (!lease.value) return null
+  const l = lease.value
+  const start = new Date(l.start_date)
+  const end   = new Date(l.end_date)
+  const today = new Date()
+  const msPerMonth = 1000 * 60 * 60 * 24 * 30.44
+  const totalMonths  = l.duration_months || Math.max(1, Math.round((end.getTime() - start.getTime()) / msPerMonth))
+  const monthsCompleted = Math.min(totalMonths, Math.max(0, Math.floor((today.getTime() - start.getTime()) / msPerMonth)))
+  const statusMap: Record<string, 'Active' | 'Inactive' | 'Expired'> = {
+    ACTIVE: 'Active', EXPIRED: 'Expired', TERMINATED: 'Expired', PENDING: 'Inactive', RENEWED: 'Inactive',
+  }
+  const roomLabel = room.value
+    ? `Room ${room.value.room_number} — ${TYPE_LABEL[room.value.room_type as keyof typeof TYPE_LABEL] ?? room.value.room_type}`
+    : l.room_id?.slice(0, 8) ?? '—'
+  return {
+    room: roomLabel,
+    monthlyRent: l.monthly_rate,
+    leaseStart: fmtDate(l.start_date),
+    leaseEnd:   fmtDate(l.end_date),
+    monthsCompleted,
+    totalMonths,
+    status: statusMap[l.status] ?? 'Inactive',
+  }
+})
+
+const TYPE_LABEL_PAY: Record<string, string> = {
+  RENT: 'rent', DEPOSIT: 'Security deposit', ADVANCE: 'Advance payment',
+  PENALTY: 'Penalty fee', UTILITY: 'Utility bill',
+}
+
+const paymentsForCard = computed(() => {
+  return payments.value.map((p: any, i: number) => {
+    const isPaid   = p.status === 'CONFIRMED'
+    const isFailed = p.status === 'FAILED' || p.status === 'REFUNDED'
+    const periodDt = p.period_start ? new Date(p.period_start) : new Date(p.payment_date || p.created_at)
+    const month    = periodDt.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+    const typeSuffix = TYPE_LABEL_PAY[p.type] ?? (p.type ?? 'Payment')
+    const label   = p.type === 'RENT' ? `${month} ${typeSuffix}` : typeSuffix
+    const paidAt  = p.confirmed_at || p.payment_date
+    const dueAt   = p.period_end   || p.payment_date
+    const dueOrPaidDate = isPaid
+      ? `Paid ${fmtDate(paidAt)}`
+      : isFailed
+        ? `Failed ${fmtDate(p.payment_date)}`
+        : `Due ${fmtDate(dueAt)}`
+    return {
+      id:           i,
+      rawId:        p.id,
+      label,
+      dueOrPaidDate,
+      amount:       p.amount,
+      status:       isPaid ? 'Paid' : 'Unpaid',
+      method:       p.method ?? '',
+      receiptNo:    p.receipt_number ?? '',
+    }
+  })
+})
+
+const maintenanceForCard = computed(() => {
+  const statusMap: Record<string, 'In progress' | 'Done' | 'Pending'> = {
+    SUBMITTED: 'Pending', ASSIGNED: 'In progress', IN_PROGRESS: 'In progress',
+    COMPLETED: 'Done', CLOSED: 'Done', REJECTED: 'Done',
+  }
+  return maintenanceRequests.value.map((r: any, i: number) => {
+    const d = new Date(r.created_at)
+    const submittedDate = `Submitted ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+    return {
+      id:            i,
+      title:         r.title,
+      submittedDate,
+      status:        statusMap[r.status] ?? 'Pending',
+    }
+  })
+})
+
+const messagesForCard = computed(() => {
+  return messages.value.map((m: any, i: number) => {
+    const ts  = m.created_at
+    const d   = ts ? new Date(ts) : new Date()
+    const now = new Date()
+    const diffH = Math.floor((now.getTime() - d.getTime()) / 3_600_000)
+    let time: string
+    if (diffH < 1)       time = 'Just now'
+    else if (diffH < 24) time = `${diffH}h ago`
+    else if (diffH < 48) time = 'Yesterday'
+    else                  time = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    const senderName = m.sender_name ||
+      (m.direction === 'MANAGEMENT_TO_TENANT' ? 'ResidEase Admin' : 'Tenant')
+    return {
+      id:       i,
+      rawId:    m.id,
+      threadId: m.thread_id,
+      senderName,
+      subject:  m.subject ?? undefined,
+      preview:  m.body || '',
+      time,
+      isUnread: m.status === 'UNREAD' || !m.read_at,
+    }
+  })
+})
+
 const hasBooking    = ref(false)
 const managerBanner = ref('')
 const rejectedManagerReq = ref<ManagerRoleRequestItem | null>(null)
 const showLogoutConfirm  = ref(false)
+const rejectedBooking = ref<{ room_number?: string; reason: string } | null>(null)
+const showRejectedManagerNotice = ref(false)
 
 // ─── Room browsing state (Home section) ────────────────────────────────────────────────────
 const rooms          = ref<Room[]>([])
@@ -62,8 +180,13 @@ const bookingError       = ref('')
 const bookingSuccess     = ref('')
 const bookingLoading     = ref(false)
 const bookingForm      = reactive({
-  full_name: '', email: '', phone: '', address: '', city: '', province: '',
+  full_name: '', last_name: '', email: '', phone: '',
+  address: '', city: '', province: '',
   desired_move_in_date: '', message: '',
+  date_of_birth: '', gender: '', civil_status: '', nationality: 'Filipino',
+  occupation: '', employer: '', monthly_income: '',
+  emergency_contact_name: '', emergency_contact_phone: '', emergency_contact_relationship: '',
+  id_document: '',
 })
 
 const availableCount = computed(() => rooms.value.filter(isAvailable).length)
@@ -104,13 +227,25 @@ function resetFilters() {
 }
 
 function openBookingFromRoom(room: Room) {
+  if (rejectedManagerReq.value) {
+    showRejectedManagerNotice.value = true
+    return
+  }
   if (hasBooking.value) {
     showAlreadyBooked.value = true
     return
   }
   bookingRoom.value = room
   bookingError.value = ''; bookingSuccess.value = ''
-  Object.assign(bookingForm, { full_name: username, email:'', phone:'', address:'', city:'', province:'', desired_move_in_date:'', message:'' })
+  Object.assign(bookingForm, {
+    full_name: username, last_name: '', email: '', phone: '',
+    address: '', city: '', province: '',
+    desired_move_in_date: '', message: '',
+    date_of_birth: '', gender: '', civil_status: '', nationality: 'Filipino',
+    occupation: '', employer: '', monthly_income: '',
+    emergency_contact_name: '', emergency_contact_phone: '', emergency_contact_relationship: '',
+    id_document: '',
+  })
   showBookingModal.value = true
 }
 
@@ -121,6 +256,7 @@ async function submitBooking() {
     const res = await bookingService.apply({
       room_id:              bookingRoom.value.id,
       full_name:            bookingForm.full_name,
+      last_name:            bookingForm.last_name || undefined,
       email:                bookingForm.email,
       phone:                bookingForm.phone,
       address:              bookingForm.address,
@@ -128,6 +264,17 @@ async function submitBooking() {
       province:             bookingForm.province || undefined,
       desired_move_in_date: bookingForm.desired_move_in_date || undefined,
       message:              bookingForm.message || undefined,
+      date_of_birth:        bookingForm.date_of_birth || undefined,
+      gender:               bookingForm.gender || undefined,
+      civil_status:         bookingForm.civil_status || undefined,
+      nationality:          bookingForm.nationality || 'Filipino',
+      occupation:           bookingForm.occupation || undefined,
+      employer:             bookingForm.employer || undefined,
+      monthly_income:       bookingForm.monthly_income ? Number(bookingForm.monthly_income) : undefined,
+      emergency_contact_name:         bookingForm.emergency_contact_name || undefined,
+      emergency_contact_phone:        bookingForm.emergency_contact_phone || undefined,
+      emergency_contact_relationship: bookingForm.emergency_contact_relationship || undefined,
+      id_document:                    bookingForm.id_document || undefined,
     })
     bookingSuccess.value = res.message
   } catch (err: any) {
@@ -171,10 +318,25 @@ onMounted(async () => {
     if (m.status   === 'fulfilled') maintenanceRequests.value = m.value ?? []
     if (msg.status === 'fulfilled') messages.value            = msg.value ?? []
 
+    // Fetch room details for hero stats and lease card
+    const roomId = tenant.value?.room_id || lease.value?.room_id
+    if (roomId) {
+      getRoom(roomId).then(r => { room.value = r }).catch(() => {})
+    }
+
     if (bookings.status === 'fulfilled') {
       const list = (bookings.value as any)?.bookings ?? []
       const approved = list.some((b: any) => b.status === 'APPROVED')
       if (approved || lease.value) hasBooking.value = true
+      // Show rejection banner for the most recent rejected booking
+      const rejected = list.filter((b: any) => b.status === 'REJECTED')
+        .sort((a: any, z: any) => new Date(z.created_at).getTime() - new Date(a.created_at).getTime())[0]
+      if (rejected && !hasBooking.value) {
+        rejectedBooking.value = {
+          room_number: rejected.room_number,
+          reason: rejected.review_notes || 'No reason provided.',
+        }
+      }
     }
     if (lease.value) hasBooking.value = true
 
@@ -210,8 +372,38 @@ function getGreeting() {
 
 // ── Event handlers ─────────────────────────────────────────────────────────────
 
-function handlePayNow(amount: number) {
-  alert(`Redirecting to payment gateway for ₱${amount.toLocaleString()}…`)
+const payNowLoading = ref(false)
+
+async function handlePayNow(amount: number) {
+  if (payNowLoading.value) return
+  if (!lease.value || !tenant.value) {
+    alert('Lease or tenant data not loaded yet.')
+    return
+  }
+  const now = new Date()
+  const periodStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
+  const periodEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString()
+  try {
+    payNowLoading.value = true
+    const result = await initiatePaypalPayment({
+      tenant_id:    String(tenant.value.id),
+      lease_id:     String(lease.value.id),
+      room_id:      String(lease.value.room_id),
+      amount,
+      type:         'RENT',
+      period_start: periodStart,
+      period_end:   periodEnd,
+    })
+    if (result?.approval_url) {
+      window.location.href = result.approval_url
+    } else {
+      alert('Payment initiated but no redirect URL returned.')
+    }
+  } catch (e: any) {
+    alert(`Payment initiation failed: ${e?.response?.data?.message ?? e.message ?? 'Unknown error'}`)
+  } finally {
+    payNowLoading.value = false
+  }
 }
 
 function handleSubmitMaintenance() {
@@ -254,8 +446,15 @@ async function submitMaintenance() {
   }
 }
 
-function handleOpenMessage(id: number) {
-  alert(`Opening message ${id}…`)
+async function handleOpenMessage(id: number) {
+  const msg = messagesForCard.value[id]
+  if (!msg) return
+  scrollTo('messages')
+  if (msg.threadId) {
+    markThreadRead(msg.threadId).then(() => {
+      getMessages().then(data => { messages.value = data }).catch(() => {})
+    }).catch(() => {})
+  }
 }
 
 function handleLogout() {
@@ -297,6 +496,14 @@ async function markAllRead() {
   unreadCount.value = 0
 }
 
+async function handleNotifClick(n: NotificationItem) {
+  if (!n.is_read) {
+    markNotificationRead(n.id).catch(() => {})
+    n.is_read = true
+    unreadCount.value = Math.max(0, unreadCount.value - 1)
+  }
+}
+
 const lockedSections = ['my-room', 'payments', 'maintenance', 'messages']
 
 function scrollTo(sectionId: string) {
@@ -309,8 +516,8 @@ function scrollTo(sectionId: string) {
 function onScroll() {
   const sections = ['home', 'my-room', 'payments', 'maintenance', 'messages']
   for (const id of sections) {
-    const el = document.getElementById(id)
-    if (el) {
+    const el = document.getElementById(id) as HTMLElement | null
+    if (el && el.offsetHeight > 0) {
       const rect = el.getBoundingClientRect()
       if (rect.top <= 100) activeSection.value = id
     }
@@ -376,10 +583,16 @@ onUnmounted(() => {
               <button v-if="unreadCount > 0" class="notif-panel__mark-all" @click="markAllRead">Mark all read</button>
             </div>
             <div v-if="notifications.length === 0" class="notif-panel__empty">No new notifications</div>
-            <div v-for="n in notifications" :key="n.id" class="notif-item" :class="{ 'notif-item--unread': !n.is_read }">
+            <div
+              v-for="n in notifications"
+              :key="n.id"
+              class="notif-item"
+              :class="{ 'notif-item--unread': !n.is_read }"
+              @click="handleNotifClick(n)"
+            >
               <div class="notif-item__title">{{ n.title }}</div>
               <div class="notif-item__msg">{{ n.message }}</div>
-              <div class="notif-item__time">{{ new Date(n.created_at).toLocaleDateString() }}</div>
+              <div class="notif-item__time">{{ new Date(n.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }}</div>
             </div>
           </div>
         </div>
@@ -388,6 +601,21 @@ onUnmounted(() => {
         <button class="navbar__logout-btn" @click="handleLogout">Logout</button>
       </div>
     </nav>
+
+    <!-- ── Booking rejected banner ───────────────────────────────────────── -->
+    <div v-if="rejectedBooking" class="rejected-banner">
+      <div class="banner-content">
+        <span class="banner-icon">❌</span>
+        <div class="banner-text">
+          <strong>Booking Rejected{{ rejectedBooking.room_number ? ` — Room ${rejectedBooking.room_number}` : '' }}</strong>
+          <p class="banner-hint">Reason: {{ rejectedBooking.reason }}</p>
+        </div>
+      </div>
+      <div class="banner-actions">
+        <button class="banner-browse" @click="rejectedBooking = null; scrollTo('home')">Browse Other Rooms →</button>
+        <button class="banner-dismiss" @click="rejectedBooking = null">Dismiss</button>
+      </div>
+    </div>
 
     <!-- ── Manager approved banner ─────────────────────────────────────────── -->
     <div v-if="managerBanner" class="manager-banner">
@@ -469,41 +697,62 @@ onUnmounted(() => {
           <div v-show="activeSection === 'my-room'" id="my-room">
             <header class="hero-dash hero-dash--light">
               <div class="hero-dash__left">
-                <h1>{{ getGreeting() }}, {{ tenant?.name?.split(' ')[0] ?? username }}!</h1>
+                <h1>{{ getGreeting() }}, {{ tenant?.first_name ?? tenant?.full_name?.split(' ')[0] ?? username }}!</h1>
                 <p>Here's your boarding house overview for today.</p>
               </div>
               <div class="hero-dash__stats">
                 <div class="hero-dash__stat">
                   <span class="stat-label">Your room</span>
-                  <span class="stat-value stat-value--purple">{{ tenant?.room_number ?? tenant?.room ?? '—' }}</span>
+                  <span class="stat-value stat-value--purple">{{ room?.room_number ?? '—' }}</span>
                 </div>
                 <div class="hero-dash__stat">
                   <span class="stat-label">Floor</span>
-                  <span class="stat-value stat-value--purple">{{ tenant?.floor_level ?? tenant?.floor ?? '—' }}</span>
+                  <span class="stat-value stat-value--purple">{{ room?.floor_level ? floorShort(room.floor_level) : '—' }}</span>
                 </div>
                 <div class="hero-dash__stat">
                   <span class="stat-label">Status</span>
-                  <span class="stat-value stat-value--green">{{ tenant?.status ?? 'Active' }} ✓</span>
+                  <span class="stat-value stat-value--green">{{ tenant?.status === 'ACTIVE' ? 'Active' : (tenant?.status ?? 'Active') }} ✓</span>
                 </div>
               </div>
             </header>
             <main class="content">
               <section class="my-room-grid">
-                <div class="my-room-col my-room-col--lease">
-                  <LeaseCard v-if="lease" :lease="lease" />
-                  <div v-else class="empty-section">No lease information found.</div>
-                </div>
+                <!-- Lease details -->
                 <div class="my-room-col">
-                  <PaymentsCard v-if="payments.length" :payments="payments" @pay-now="handlePayNow" />
-                  <div v-else class="empty-section">No payment records.</div>
+                  <LeaseCard v-if="leaseForCard" :lease="leaseForCard" />
+                  <div v-else class="empty-card">
+                    <div class="empty-card__header">
+                      <span class="empty-card__title">Lease details</span>
+                    </div>
+                    <p class="empty-card__msg">No lease information found.</p>
+                  </div>
                 </div>
+                <!-- Payments -->
                 <div class="my-room-col">
-                  <MaintenanceCard :requests="maintenanceRequests" @submit-new="handleSubmitMaintenance" />
+                  <PaymentsCard v-if="paymentsForCard.length" :payments="paymentsForCard" :pay-loading="payNowLoading" @pay-now="handlePayNow" @view-all="scrollTo('payments')" />
+                  <div v-else class="empty-card">
+                    <div class="empty-card__header">
+                      <span class="empty-card__title">Payments</span>
+                      <span class="empty-card__viewall" @click="scrollTo('payments')">View all</span>
+                    </div>
+                    <p class="empty-card__msg">No payment records.</p>
+                  </div>
+                </div>
+                <!-- Maintenance -->
+                <div class="my-room-col">
+                  <MaintenanceCard :requests="maintenanceForCard" @submit-new="handleSubmitMaintenance" @view-all="scrollTo('maintenance')" />
                 </div>
               </section>
+              <!-- Messages full width -->
               <section class="section--full">
-                <MessagesCard v-if="messages.length" :messages="messages" @open-message="handleOpenMessage" />
-                <div v-else class="empty-section">No messages yet.</div>
+                <MessagesCard v-if="messagesForCard.length" :messages="messagesForCard" @open-message="handleOpenMessage" @view-all="scrollTo('messages')" />
+                <div v-else class="empty-card">
+                  <div class="empty-card__header">
+                    <span class="empty-card__title">Messages from management</span>
+                    <span class="empty-card__viewall" @click="scrollTo('messages')">View all</span>
+                  </div>
+                  <p class="empty-card__msg">No messages yet.</p>
+                </div>
               </section>
             </main>
           </div>
@@ -512,7 +761,7 @@ onUnmounted(() => {
           <div v-show="activeSection === 'payments'" id="payments">
             <main class="content">
               <section class="section--full">
-                <PaymentsCard v-if="payments.length" :payments="payments" @pay-now="handlePayNow" />
+                <PaymentsCard v-if="paymentsForCard.length" :payments="paymentsForCard" :pay-loading="payNowLoading" @pay-now="handlePayNow" @view-all="scrollTo('payments')" />
                 <div v-else class="empty-section">No payment records found.</div>
               </section>
             </main>
@@ -522,7 +771,7 @@ onUnmounted(() => {
           <div v-show="activeSection === 'maintenance'" id="maintenance">
             <main class="content">
               <section class="section--full">
-                <MaintenanceCard :requests="maintenanceRequests" @submit-new="handleSubmitMaintenance" />
+                <MaintenanceCard :requests="maintenanceForCard" @submit-new="handleSubmitMaintenance" />
               </section>
             </main>
           </div>
@@ -531,7 +780,7 @@ onUnmounted(() => {
           <div v-show="activeSection === 'messages'" id="messages">
             <main class="content">
               <section class="section--full">
-                <MessagesCard v-if="messages.length" :messages="messages" @open-message="handleOpenMessage" />
+                <MessagesCard v-if="messagesForCard.length" :messages="messagesForCard" @open-message="handleOpenMessage" />
                 <div v-else class="empty-section">No messages yet.</div>
               </section>
             </main>
@@ -539,6 +788,20 @@ onUnmounted(() => {
         </template>
       </template>
     </template>
+
+    <!-- ── Rejected Manager Application Notice ─────────────────────────── -->
+    <Teleport to="body">
+      <div v-if="showRejectedManagerNotice" class="modal-overlay" @click.self="showRejectedManagerNotice = false">
+        <div class="modal-card" style="max-width:400px;text-align:center">
+          <button class="modal-close" @click="showRejectedManagerNotice = false">✕</button>
+          <div style="font-size:48px;margin-bottom:12px">🚫</div>
+          <h2 style="font-size:18px;font-weight:800;color:#1f2937;margin:0 0 8px">Cannot Book a Room</h2>
+          <p style="font-size:14px;color:#6b7280;margin:0 0 6px">Your <strong>Manager Role Application</strong> was rejected by the admin.</p>
+          <p style="font-size:13px;color:#9ca3af;margin:0 0 20px">{{ rejectedManagerReq?.review_notes ? 'Reason: ' + rejectedManagerReq.review_notes : 'Please contact the admin for more information.' }}</p>
+          <button class="btn-primary" style="background:#ef4444" @click="showRejectedManagerNotice = false">Close</button>
+        </div>
+      </div>
+    </Teleport>
 
     <!-- ── Already Booked Notice ─────────────────────────────────────────── -->
     <Teleport to="body">
@@ -563,11 +826,69 @@ onUnmounted(() => {
               <h2>Book Room {{ bookingRoom?.room_number }}</h2>
               <p class="modal-sub">₱{{ bookingRoom?.monthly_rate?.toLocaleString() }}/mo &mdash; {{ bookingRoom?.room_type }}</p>
             </div>
-            <div class="field"><label>Full Name</label><input v-model="bookingForm.full_name" type="text" class="input" /></div>
-            <div class="field"><label>Email</label><input v-model="bookingForm.email" type="email" class="input" /></div>
-            <div class="field"><label>Phone</label><input v-model="bookingForm.phone" type="text" class="input" /></div>
-            <div class="field"><label>Address</label><input v-model="bookingForm.address" type="text" class="input" /></div>
+            <p class="form-section-title">Personal Information</p>
+            <div class="field-row">
+              <div class="field"><label>First Name</label><input v-model="bookingForm.full_name" type="text" class="input" /></div>
+              <div class="field"><label>Last Name</label><input v-model="bookingForm.last_name" type="text" class="input" /></div>
+            </div>
+            <div class="field-row">
+              <div class="field"><label>Email</label><input v-model="bookingForm.email" type="email" class="input" /></div>
+              <div class="field"><label>Phone</label><input v-model="bookingForm.phone" type="text" class="input" /></div>
+            </div>
+            <div class="field-row">
+              <div class="field"><label>Date of Birth</label><input v-model="bookingForm.date_of_birth" type="date" class="input" /></div>
+              <div class="field"><label>Gender</label>
+                <select v-model="bookingForm.gender" class="input">
+                  <option value="">Select</option>
+                  <option value="MALE">Male</option>
+                  <option value="FEMALE">Female</option>
+                  <option value="PREFER_NOT_TO_SAY">Prefer not to say</option>
+                </select>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field"><label>Civil Status</label>
+                <select v-model="bookingForm.civil_status" class="input">
+                  <option value="">Select</option>
+                  <option value="SINGLE">Single</option>
+                  <option value="MARRIED">Married</option>
+                  <option value="WIDOWED">Widowed</option>
+                  <option value="DIVORCED">Divorced</option>
+                </select>
+              </div>
+              <div class="field"><label>Nationality</label><input v-model="bookingForm.nationality" type="text" class="input" /></div>
+            </div>
+            <p class="form-section-title">Address &amp; Move-in</p>
+            <div class="field"><label>Home Address</label><input v-model="bookingForm.address" type="text" class="input" /></div>
+            <div class="field-row">
+              <div class="field"><label>City</label><input v-model="bookingForm.city" type="text" class="input" /></div>
+              <div class="field"><label>Province</label><input v-model="bookingForm.province" type="text" class="input" /></div>
+            </div>
             <div class="field"><label>Desired Move-in Date</label><input v-model="bookingForm.desired_move_in_date" type="date" class="input" /></div>
+            <p class="form-section-title">Occupation</p>
+            <div class="field-row">
+              <div class="field"><label>Occupation</label><input v-model="bookingForm.occupation" type="text" class="input" placeholder="e.g. Student, Employee" /></div>
+              <div class="field"><label>Employer / School</label><input v-model="bookingForm.employer" type="text" class="input" /></div>
+            </div>
+            <div class="field"><label>Monthly Income <span style="color:#9ca3af;font-weight:400">(optional)</span></label><input v-model="bookingForm.monthly_income" type="number" class="input" placeholder="₱" /></div>
+            <p class="form-section-title">Emergency Contact</p>
+            <div class="field-row">
+              <div class="field"><label>Contact Name</label><input v-model="bookingForm.emergency_contact_name" type="text" class="input" /></div>
+              <div class="field"><label>Contact Phone</label><input v-model="bookingForm.emergency_contact_phone" type="text" class="input" /></div>
+            </div>
+            <div class="field"><label>Relationship</label>
+              <select v-model="bookingForm.emergency_contact_relationship" class="input">
+                <option value="">Select</option>
+                <option value="PARENT">Parent</option>
+                <option value="SPOUSE">Spouse</option>
+                <option value="SIBLING">Sibling</option>
+                <option value="RELATIVE">Relative</option>
+                <option value="FRIEND">Friend</option>
+                <option value="GUARDIAN">Guardian</option>
+                <option value="OTHER">Other</option>
+              </select>
+            </div>
+            <div class="field"><label>ID Document URL <span style="color:#9ca3af;font-weight:400">(optional — link to photo of valid ID)</span></label><input v-model="bookingForm.id_document" type="url" class="input" placeholder="https://…" /></div>
             <div class="field"><label>Message <span style="color:#9ca3af;font-weight:400">(optional)</span></label><textarea v-model="bookingForm.message" class="input" rows="2"></textarea></div>
             <p v-if="bookingError" class="msg error">{{ bookingError }}</p>
             <button class="btn-primary" :disabled="bookingLoading" @click="submitBooking">{{ bookingLoading ? 'Submitting…' : 'Submit Booking Request' }}</button>
@@ -767,6 +1088,24 @@ onUnmounted(() => {
 }
 .navbar__logout-btn:hover { border-color: #ef4444; color: #ef4444; }
 
+/* ── Rejected booking banner ───────────────────────────────────────── */
+.rejected-banner {
+  background: linear-gradient(90deg, #ef4444, #dc2626);
+  color: #fff;
+  padding: 14px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.banner-browse {
+  background: #fff; color: #dc2626; font-size: 12px; font-weight: 700;
+  padding: 7px 16px; border-radius: 20px; border: none; cursor: pointer;
+  transition: transform .1s, box-shadow .15s;
+}
+.banner-browse:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.12); }
+
 /* ── Manager banner ────────────────────────────────────────────────── */
 .manager-banner {
   background: linear-gradient(90deg, #4ade80, #22c55e);
@@ -823,8 +1162,8 @@ onUnmounted(() => {
 
 /* Light hero (matches screenshot) */
 .hero-dash--light {
-  background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
-  border-bottom: 1px solid #e0ddf7;
+  background: #ffffff;
+  border-bottom: 1px solid #ede9fe;
 }
 .hero-dash--light .hero-dash__left h1 { color: #1e1b4b; }
 .hero-dash--light .hero-dash__left p  { color: #6b7280; }
@@ -839,11 +1178,47 @@ onUnmounted(() => {
 /* My Room 3-column grid */
 .my-room-grid {
   display: grid;
-  grid-template-columns: 1.6fr 1fr 1fr;
+  grid-template-columns: 1.5fr 1fr 1fr;
   gap: 20px;
   margin-bottom: 20px;
+  align-items: start;
 }
 .my-room-col { min-width: 0; }
+
+/* Empty state card (Picture 2 style) */
+.empty-card {
+  background: #fff;
+  border: 1px solid #e9e6f5;
+  border-radius: 16px;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.empty-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.empty-card__title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+}
+.empty-card__viewall {
+  font-size: 13px;
+  color: #7c3aed;
+  font-weight: 500;
+  cursor: pointer;
+}
+.empty-card__msg {
+  text-align: center;
+  color: #9ca3af;
+  font-size: 14px;
+  padding: 28px 0;
+  margin: 0;
+}
 
 /* ── Locked screen ────────────────────────────────────────────────── */
 .locked-screen {
@@ -905,13 +1280,18 @@ onUnmounted(() => {
 
 /* ── Content ─────────────────────────────────────────────────── */
 .content {
-  padding: 24px 32px;
+  padding: 28px 36px;
   display: flex;
   flex-direction: column;
   gap: 20px;
-  max-width: 1100px;
+  max-width: 1200px;
+  width: 100%;
   margin: 0 auto;
+  box-sizing: border-box;
 }
+
+#my-room { background: #f5f3ff; min-height: calc(100vh - 60px); }
+#payments, #maintenance, #messages { background: #f5f3ff; min-height: calc(100vh - 60px); }
 
 .section--full {
   width: 100%;
@@ -926,9 +1306,8 @@ onUnmounted(() => {
 /* ── Responsive ──────────────────────────────────────────────── */
 @media (max-width: 1024px) {
   .my-room-grid { grid-template-columns: 1fr 1fr; }
-  .my-room-col--lease { grid-column: 1 / -1; }
+  .my-room-col:first-child { grid-column: 1 / -1; }
 }
-
 @media (max-width: 768px) {
   .section--two-col {
     grid-template-columns: 1fr;
@@ -975,6 +1354,11 @@ onUnmounted(() => {
 .modal-header { display: flex; flex-direction: column; gap: 4px; }
 .modal-header h2 { font-size: 22px; font-weight: 700; color: #111827; margin: 0; }
 .modal-sub { font-size: 14px; color: #6b7280; margin: 0; }
+.form-section-title {
+  font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+  color: #7c3aed; margin: 4px 0 -4px; padding-bottom: 6px; border-bottom: 1px solid #ede9fe;
+}
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field label { font-size: 14px; color: #4b5563; font-weight: 500; }
 .input {

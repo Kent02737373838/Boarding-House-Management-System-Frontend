@@ -19,6 +19,21 @@ import { notificationService, type NotificationItem } from '../../services/notif
 
 type Section = 'dashboard' | 'tenants' | 'rooms' | 'leases' | 'payments' | 'reports' | 'maintenance' | 'messages' | 'bookings'
 
+// ── Local type extensions (adds fields present in API response but missing from service types) ──
+type ExtendedManagerPayment = ManagerPayment & {
+  type?: string
+  receipt_number?: string
+}
+
+type ExtendedManagerRoom = ManagerRoom & {
+  max_occupants?: number
+}
+
+type ExtendedTenantResponse = TenantResponse & {
+  room_number?: string
+  room_id?: string
+}
+
 const router   = useRouter()
 const auth     = useAuthStore()
 
@@ -28,16 +43,16 @@ const loading       = ref(false)
 const error         = ref('')
 
 const dashboard      = ref<ManagerDashboardPayload | null>(null)
-const rooms          = ref<ManagerRoom[]>([])
+const rooms          = ref<ExtendedManagerRoom[]>([])
 const leases         = ref<ManagerLease[]>([])
-const payments       = ref<ManagerPayment[]>([])
+const payments       = ref<ExtendedManagerPayment[]>([])
 const maintenance    = ref<ManagerMaintenance[]>([])
 const bookings           = ref<BookingItem[]>([])
 const approvedBookings   = ref<BookingItem[]>([])
 const viewingBooking     = ref<BookingItem | null>(null)
 const confirmRejectId    = ref('')
 const rejectReason       = ref('')
-const tenants        = ref<TenantResponse[]>([])
+const tenants        = ref<ExtendedTenantResponse[]>([])
 const tenantStats    = ref<TenantStats | null>(null)
 const paymentStats   = ref<PaymentStats | null>(null)
 const notifications  = ref<NotificationItem[]>([])
@@ -141,7 +156,6 @@ async function removeRoom(id: string, roomNumber: string, roomStatus: string) {
     }
     return
   }
-  // Vacant room — offer to delete (admin only) or just confirm
   if (!window.confirm(`Remove room ${roomNumber}? This cannot be undone.`)) return
   try {
     await roomService.deleteRoom(id)
@@ -184,7 +198,6 @@ const filteredTenants = computed(() =>
     : activeTenants.value
 )
 
-// Tenants in reserved rooms come from APPROVED bookings
 interface ReservedTenant {
   id: string
   full_name: string
@@ -368,6 +381,10 @@ async function rejectBooking(id: string) {
   if (!confirmRejectId.value) { confirmRejectId.value = id; return }
   try {
     await bookingService.review(id, { status: 'REJECTED', review_notes: rejectReason.value || 'Rejected by manager' })
+    bookings.value         = bookings.value.filter(b => b.id !== id)
+    approvedBookings.value = approvedBookings.value.filter(b => b.id !== id)
+    const rejected = [...bookings.value, ...approvedBookings.value].find(b => b.id === id)
+    if (rejected) tenants.value = tenants.value.filter(t => t.user_id !== rejected.user_id)
     closeBookingModal()
     await loadManagerData()
   } catch (e: any) { error.value = e?.message ?? 'Failed to reject booking.' }
@@ -384,6 +401,116 @@ async function updateMaintenanceStatus(id: string, action: 'start' | 'complete' 
 }
 
 onMounted(() => { void loadManagerData() })
+
+// ── Record Payment Modal ──────────────────────────────────────────────────────
+const showPaymentModal = ref(false)
+const paymentLoading   = ref(false)
+const paymentError     = ref('')
+const paymentSuccess   = ref('')
+const paymentForm = ref({
+  tenant_id:    '',
+  lease_id:     '',
+  room_id:      '',
+  amount:       0,
+  type:         'RENT',
+  method:       'CASH',
+  reference_no: '',
+  notes:        '',
+  period_start: '',
+  period_end:   '',
+})
+
+function openPaymentModal() {
+  paymentError.value   = ''
+  paymentSuccess.value = ''
+  const first = tenants.value[0]
+  const firstLease = leases.value[0]
+  paymentForm.value = {
+    tenant_id:    first?.id ?? '',
+    lease_id:     firstLease?.id ?? '',
+    room_id:      firstLease?.room_id ?? first?.room_id ?? '',
+    amount:       0,
+    type:         'RENT',
+    method:       'CASH',
+    reference_no: '',
+    notes:        '',
+    period_start: '',
+    period_end:   '',
+  }
+  showPaymentModal.value = true
+}
+
+function closePaymentModal() {
+  showPaymentModal.value = false
+  paymentError.value     = ''
+  paymentSuccess.value   = ''
+}
+
+function onPaymentTenantChange() {
+  const tid   = paymentForm.value.tenant_id
+  const lease = leases.value.find(l => l.tenant_id === tid)
+  if (lease) {
+    paymentForm.value.lease_id = lease.id
+    paymentForm.value.room_id  = lease.room_id
+  }
+}
+
+// ── FIX: was posting to /api/payments/cash (wrong prefix → 403) ──────────────
+async function submitPayment() {
+  paymentError.value   = ''
+  paymentSuccess.value = ''
+  if (!paymentForm.value.tenant_id) { paymentError.value = 'Please select a tenant.'; return }
+  if (!paymentForm.value.lease_id)  { paymentError.value = 'Lease ID is required.'; return }
+  if (!paymentForm.value.room_id)   { paymentError.value = 'Room ID is required.'; return }
+  if (!paymentForm.value.amount || paymentForm.value.amount <= 0) { paymentError.value = 'Amount must be greater than 0.'; return }
+
+  paymentLoading.value = true
+  try {
+    const payload: any = {
+      tenant_id: paymentForm.value.tenant_id,
+      lease_id:  paymentForm.value.lease_id,
+      room_id:   paymentForm.value.room_id,
+      amount:    Number(paymentForm.value.amount),
+      type:      paymentForm.value.type,
+      method:    paymentForm.value.method,
+    }
+    if (paymentForm.value.reference_no) payload.reference_no = paymentForm.value.reference_no
+    if (paymentForm.value.notes)        payload.notes        = paymentForm.value.notes
+    if (paymentForm.value.period_start) payload.period_start = new Date(paymentForm.value.period_start).toISOString()
+    if (paymentForm.value.period_end)   payload.period_end   = new Date(paymentForm.value.period_end).toISOString()
+
+    const res = await fetch('/api/manager/payments', {   // ✅ fixed: was /api/payments/cash
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth.token}` },
+      body:    JSON.stringify(payload),
+    })
+    const json = await res.json()
+    if (!res.ok) throw new Error(json?.detail ?? json?.message ?? 'Failed to record payment.')
+    paymentSuccess.value = `Payment recorded! Receipt: ${json.receipt_number ?? '—'}`  // ✅ fixed: was json.data?.receipt_number
+    await loadManagerData()
+  } catch (e: any) {
+    paymentError.value = e?.message ?? 'Failed to record payment.'
+  } finally {
+    paymentLoading.value = false
+  }
+}
+
+// ── FIX: was calling /api/payments/:id/confirm (wrong prefix → 403) ──────────
+async function confirmPayment(paymentId: string) {
+  try {
+    const res = await fetch(`/api/manager/payments/${paymentId}/confirm`, {   // ✅ fixed: was /api/payments/
+      method:  'PATCH',
+      headers: { Authorization: `Bearer ${auth.token}` },
+    })
+    if (!res.ok) {
+      const json = await res.json()
+      throw new Error(json?.detail ?? 'Failed to confirm payment.')
+    }
+    await loadManagerData()
+  } catch (e: any) {
+    error.value = e?.message ?? 'Failed to confirm payment.'
+  }
+}
 </script>
 
 <template>
@@ -680,6 +807,9 @@ onMounted(() => { void loadManagerData() })
               <h1 class="page-title">Payments</h1>
               <p class="page-sub">{{ paymentStats?.paid_count ?? 0 }} paid · {{ paymentStats?.unpaid_count ?? 0 }} unpaid · {{ paymentStats?.partial_count ?? 0 }} partial</p>
             </div>
+            <div class="hdr-actions">
+              <button class="btn-primary" @click="openPaymentModal">+ Record Payment</button>
+            </div>
           </div>
           <div class="stats-grid mini">
             <div class="mini-stat"><span>Total collected</span><strong>{{ formatMoney(paymentStats?.total_collected) }}</strong></div>
@@ -689,17 +819,27 @@ onMounted(() => { void loadManagerData() })
           </div>
           <div class="panel">
             <table class="ptable full">
-              <thead><tr><th>Tenant</th><th>Amount</th><th>Method</th><th>Status</th><th>Date</th></tr></thead>
+              <thead><tr><th>Tenant</th><th>Amount</th><th>Type</th><th>Method</th><th>Receipt</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead>
               <tbody>
-                <tr v-if="loading"><td colspan="5" class="td-muted">Loading…</td></tr>
+                <tr v-if="loading"><td colspan="8" class="td-muted">Loading…</td></tr>
                 <tr v-for="p in payments" :key="p.id">
-                  <td>{{ p.tenant_id.slice(0, 8) }}</td>
+                  <td class="td-name">{{ tenants.find(t => t.id === p.tenant_id)?.full_name ?? p.tenant_id.slice(0, 8) }}</td>
                   <td class="td-amt">{{ formatMoney(p.amount) }}</td>
+                  <td>{{ p.type }}</td>
                   <td>{{ p.method }}</td>
+                  <td class="td-muted" style="font-size:11px">{{ p.receipt_number ?? '—' }}</td>
                   <td><span class="badge" :class="paymentBadgeClass(p.status)">{{ p.status }}</span></td>
                   <td>{{ formatDate(p.payment_date) }}</td>
+                  <td class="td-actions">
+                    <button
+                      v-if="p.status === 'PENDING'"
+                      class="action-btn approve"
+                      @click="confirmPayment(p.id)"
+                    >Confirm</button>
+                    <span v-else class="td-muted" style="font-size:11px">—</span>
+                  </td>
                 </tr>
-                <tr v-if="!loading && payments.length === 0"><td colspan="5" class="td-muted">No payments found.</td></tr>
+                <tr v-if="!loading && payments.length === 0"><td colspan="8" class="td-muted">No payments found.</td></tr>
               </tbody>
             </table>
           </div>
@@ -811,25 +951,74 @@ onMounted(() => { void loadManagerData() })
           <div class="view-modal-hdr">
             <div style="font-size:36px;margin-bottom:6px">&#128203;</div>
             <h2>Booking Application</h2>
-            <p>Room {{ viewingBooking.room_number ?? viewingBooking.room_id.slice(0,8) }} &mdash; &#8369;{{ viewingBooking.monthly_rent?.toLocaleString() }}/mo</p>
+            <p>Room {{ viewingBooking.room_number ?? viewingBooking.room_id.slice(0,8) }} &mdash; &#8369;{{ viewingBooking.monthly_rent?.toLocaleString() ?? '—' }}/mo</p>
+            <span class="vbadge" :class="viewingBooking.status === 'APPROVED' ? 'vbadge-approved' : viewingBooking.status === 'REJECTED' ? 'vbadge-rejected' : viewingBooking.status === 'CANCELLED' ? 'vbadge-cancelled' : 'vbadge-pending'">{{ viewingBooking.status }}</span>
           </div>
+
+          <p class="vsec-label">Applicant Information</p>
           <div class="vg">
-            <div class="vf"><span class="vfl">Applicant</span><span class="vfv">{{ viewingBooking.full_name }}</span></div>
-            <div class="vf"><span class="vfl">Email</span><span class="vfv">{{ viewingBooking.email }}</span></div>
-            <div class="vf"><span class="vfl">Phone</span><span class="vfv">{{ viewingBooking.phone }}</span></div>
-            <div class="vf"><span class="vfl">Address</span><span class="vfv">{{ viewingBooking.address }}</span></div>
-            <div class="vf" v-if="viewingBooking.desired_move_in_date"><span class="vfl">Move-in Date</span><span class="vfv">{{ viewingBooking.desired_move_in_date }}</span></div>
-            <div class="vf" v-if="viewingBooking.message"><span class="vfl">Message</span><span class="vfv">{{ viewingBooking.message }}</span></div>
-            <div class="vf"><span class="vfl">Submitted</span><span class="vfv">{{ formatDate(viewingBooking.created_at) }}</span></div>
-            <div class="vf"><span class="vfl">Status</span><span class="vfv"><span class="action-btn" :class="viewingBooking.status.toLowerCase()">{{ viewingBooking.status }}</span></span></div>
+            <div class="vrow">
+              <div class="vf"><span class="vfl">Full Name</span><span class="vfv">{{ viewingBooking.full_name }}{{ viewingBooking.last_name ? ' ' + viewingBooking.last_name : '' }}</span></div>
+              <div class="vf"><span class="vfl">Email</span><span class="vfv">{{ viewingBooking.email }}</span></div>
+            </div>
+            <div class="vrow">
+              <div class="vf"><span class="vfl">Phone</span><span class="vfv">{{ viewingBooking.phone }}</span></div>
+              <div class="vf" v-if="viewingBooking.date_of_birth"><span class="vfl">Date of Birth</span><span class="vfv">{{ viewingBooking.date_of_birth }}</span></div>
+            </div>
+            <div class="vrow">
+              <div class="vf" v-if="viewingBooking.gender"><span class="vfl">Gender</span><span class="vfv">{{ viewingBooking.gender }}</span></div>
+              <div class="vf" v-if="viewingBooking.civil_status"><span class="vfl">Civil Status</span><span class="vfv">{{ viewingBooking.civil_status }}</span></div>
+            </div>
+            <div class="vrow">
+              <div class="vf" v-if="viewingBooking.nationality"><span class="vfl">Nationality</span><span class="vfv">{{ viewingBooking.nationality }}</span></div>
+              <div class="vf" v-if="viewingBooking.occupation"><span class="vfl">Occupation</span><span class="vfv">{{ viewingBooking.occupation }}</span></div>
+            </div>
+            <div class="vrow" v-if="viewingBooking.employer || viewingBooking.monthly_income">
+              <div class="vf" v-if="viewingBooking.employer"><span class="vfl">Employer</span><span class="vfv">{{ viewingBooking.employer }}</span></div>
+              <div class="vf" v-if="viewingBooking.monthly_income"><span class="vfl">Monthly Income</span><span class="vfv">{{ formatMoney(viewingBooking.monthly_income) }}</span></div>
+            </div>
           </div>
+
+          <p class="vsec-label">Address</p>
+          <div class="vg">
+            <div class="vf"><span class="vfl">Address</span><span class="vfv">{{ viewingBooking.address }}{{ viewingBooking.city ? ', ' + viewingBooking.city : '' }}{{ viewingBooking.province ? ', ' + viewingBooking.province : '' }}</span></div>
+          </div>
+
+          <p class="vsec-label">Booking Details</p>
+          <div class="vg">
+            <div class="vrow">
+              <div class="vf" v-if="viewingBooking.desired_move_in_date"><span class="vfl">Move-in Date</span><span class="vfv">{{ viewingBooking.desired_move_in_date }}</span></div>
+              <div class="vf"><span class="vfl">Submitted</span><span class="vfv">{{ formatDate(viewingBooking.created_at) }}</span></div>
+            </div>
+            <div class="vf" v-if="viewingBooking.message"><span class="vfl">Message</span><span class="vfv">{{ viewingBooking.message }}</span></div>
+            <div class="vf" v-if="viewingBooking.id_document"><span class="vfl">ID Document</span><span class="vfv"><a :href="viewingBooking.id_document" target="_blank" style="color:#2563eb;text-decoration:underline">View Document</a></span></div>
+          </div>
+
+          <template v-if="viewingBooking.emergency_contact_name || viewingBooking.emergency_contact_phone">
+            <p class="vsec-label">Emergency Contact</p>
+            <div class="vg">
+              <div class="vrow">
+                <div class="vf" v-if="viewingBooking.emergency_contact_name"><span class="vfl">Name</span><span class="vfv">{{ viewingBooking.emergency_contact_name }}</span></div>
+                <div class="vf" v-if="viewingBooking.emergency_contact_phone"><span class="vfl">Phone</span><span class="vfv">{{ viewingBooking.emergency_contact_phone }}</span></div>
+              </div>
+              <div class="vf" v-if="viewingBooking.emergency_contact_relationship"><span class="vfl">Relationship</span><span class="vfv">{{ viewingBooking.emergency_contact_relationship }}</span></div>
+            </div>
+          </template>
+
+          <template v-if="viewingBooking.review_notes">
+            <p class="vsec-label">Review Notes</p>
+            <div class="vg">
+              <div class="vf"><span class="vfl">Notes</span><span class="vfv">{{ viewingBooking.review_notes }}</span></div>
+            </div>
+          </template>
+
           <template v-if="viewingBooking.status === 'PENDING'">
-            <div v-if="confirmRejectId === viewingBooking.id" style="margin-top:4px">
+            <div v-if="confirmRejectId === viewingBooking.id" style="margin-top:8px">
               <label style="font-size:12px;color:#6b7280;font-weight:500">Rejection reason (optional)</label>
               <input v-model="rejectReason" type="text" placeholder="Enter reason"
                      style="margin-top:4px;width:100%;padding:8px 14px;border-radius:12px;border:1px solid #e0ddf7;font-size:13px;box-sizing:border-box;outline:none" />
             </div>
-            <div style="display:flex;gap:10px;margin-top:10px">
+            <div style="display:flex;gap:10px;margin-top:12px">
               <button class="vbtn-approve" @click="approveBooking(viewingBooking.id)">&#10003; Approve</button>
               <button class="vbtn-reject"  @click="rejectBooking(viewingBooking.id)">{{ confirmRejectId === viewingBooking.id ? 'Confirm Reject' : '&#10007; Reject' }}</button>
             </div>
@@ -945,6 +1134,96 @@ onMounted(() => { void loadManagerData() })
               </button>
             </div>
           </form>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- ════════════ RECORD PAYMENT MODAL ════════════ -->
+    <Transition name="modal-fade">
+      <div v-if="showPaymentModal" class="modal-overlay" @click.self="closePaymentModal">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-label="Record Payment">
+          <div class="modal-hdr">
+            <h2 class="modal-title">Record Payment</h2>
+            <button class="modal-close" @click="closePaymentModal">✕</button>
+          </div>
+
+          <div v-if="paymentError"   class="form-error">{{ paymentError }}</div>
+          <div v-if="paymentSuccess" style="margin:0 24px;padding:10px 12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:9px;color:#166534;font-size:12.5px;">{{ paymentSuccess }}</div>
+
+          <div class="modal-form">
+            <div class="form-group">
+              <label>Tenant <span class="req">*</span></label>
+              <select v-model="paymentForm.tenant_id" class="form-input" @change="onPaymentTenantChange">
+                <option value="">— Select tenant —</option>
+                <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.full_name }}</option>
+              </select>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label>Lease ID <span class="req">*</span></label>
+                <input v-model="paymentForm.lease_id" type="text" class="form-input" placeholder="Auto-filled" />
+              </div>
+              <div class="form-group">
+                <label>Room ID <span class="req">*</span></label>
+                <input v-model="paymentForm.room_id" type="text" class="form-input" placeholder="Auto-filled" />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label>Amount (₱) <span class="req">*</span></label>
+                <input v-model.number="paymentForm.amount" type="number" min="1" step="0.01" class="form-input" />
+              </div>
+              <div class="form-group">
+                <label>Type</label>
+                <select v-model="paymentForm.type" class="form-input">
+                  <option value="RENT">Rent</option>
+                  <option value="DEPOSIT">Deposit</option>
+                  <option value="ADVANCE">Advance</option>
+                  <option value="UTILITY">Utility</option>
+                  <option value="OTHER">Other</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Method</label>
+                <select v-model="paymentForm.method" class="form-input">
+                  <option value="CASH">Cash</option>
+                  <option value="BANK_TRANSFER">Bank Transfer</option>
+                  <option value="GCASH">GCash</option>
+                  <option value="OTHER">Other</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Reference No.</label>
+              <input v-model="paymentForm.reference_no" type="text" class="form-input" placeholder="Optional" />
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label>Period Start</label>
+                <input v-model="paymentForm.period_start" type="date" class="form-input" />
+              </div>
+              <div class="form-group">
+                <label>Period End</label>
+                <input v-model="paymentForm.period_end" type="date" class="form-input" />
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label>Notes</label>
+              <textarea v-model="paymentForm.notes" class="form-textarea" rows="2" placeholder="Optional notes…"></textarea>
+            </div>
+
+            <div class="modal-footer">
+              <button type="button" class="btn-outline" @click="closePaymentModal">Cancel</button>
+              <button type="button" class="btn-primary" :disabled="paymentLoading" @click="submitPayment">
+                {{ paymentLoading ? 'Recording…' : 'Record Payment' }}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </Transition>
@@ -1150,9 +1429,16 @@ onMounted(() => { void loadManagerData() })
 .view-modal-hdr h2  { font-size:20px;font-weight:800;color:#111827;margin:0 0 4px; }
 .view-modal-hdr p   { font-size:13px;color:#6b7280;margin:0; }
 .vg  { display:flex;flex-direction:column;gap:8px; }
+.vrow { display:grid;grid-template-columns:1fr 1fr;gap:8px; }
 .vf  { display:flex;flex-direction:column;gap:2px;padding:9px 13px;background:#f9fafb;border-radius:10px; }
 .vfl { font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:.04em; }
 .vfv { font-size:14px;color:#111827;font-weight:500; }
+.vsec-label { font-size:11px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 6px;padding-left:2px; }
+.vbadge { display:inline-block;margin-top:6px;padding:3px 12px;border-radius:999px;font-size:12px;font-weight:700; }
+.vbadge-pending  { background:#fef3c7;color:#92400e; }
+.vbadge-approved { background:#dcfce7;color:#166534; }
+.vbadge-rejected { background:#fee2e2;color:#991b1b; }
+.vbadge-cancelled{ background:#f3f4f6;color:#6b7280; }
 .vbtn-approve { flex:1;padding:10px;border-radius:999px;border:none;background:#dcfce7;color:#16a34a;font-size:14px;font-weight:600;cursor:pointer; }
 .vbtn-reject  { flex:1;padding:10px;border-radius:999px;border:none;background:#fee2e2;color:#dc2626;font-size:14px;font-weight:600;cursor:pointer; }
 </style>
