@@ -9,14 +9,15 @@ import Hero           from '@/components/layout/Hero.vue'
 import FilterBar      from '@/components/layout/FilterBar.vue'
 import SidebarFilters from '@/components/layout/SidebarFilters.vue'
 import RoomsGrid      from '@/components/layout/RoomsGrid.vue'
-import { getTenant, getRoom, getLease, getPayments, getMaintenanceRequests, getMessages, markThreadRead, markNotificationRead, initiatePaypalPayment } from "../../services/tenantService";
+import { getTenant, getRoom, getLease, getPayments, getMaintenanceRequests, getMessages, markThreadRead, markNotificationRead, initiatePaypalPayment, recordCashPayment } from "../../services/tenantService";
+import { getTenantMessages, getThread, sendMessage } from "../../services/messageService";
 import { maintenanceService } from "../../services/maintenanceService";
 import { bookingService }      from '../../services/bookingService'
 import { managerRequestService, type ManagerRoleRequestItem } from '../../services/managerRequestService'
 import { authService } from '../../services/authService'
 import { notificationService, type NotificationItem } from '../../services/notificationService'
 import type { Room } from '../../models/room'
-import { isAvailable, FLOOR_LABEL, TYPE_LABEL } from '../../models/room'
+import { isAvailable, TYPE_LABEL } from '../../models/room'
 import router from "../../router";
 
 const auth = useAuthStore()
@@ -324,6 +325,15 @@ onMounted(async () => {
       getRoom(roomId).then(r => { room.value = r }).catch(() => {})
     }
 
+    // Load full inbox (all messages, not just unread)
+    if (tenant.value?.id) {
+      getTenantMessages(String(tenant.value.id))
+        .then(all => {
+          messages.value = all
+          unreadCount.value = all.filter((m: any) => m.status === 'UNREAD' && m.direction === 'MANAGEMENT_TO_TENANT').length
+        }).catch(() => {})
+    }
+
     if (bookings.status === 'fulfilled') {
       const list = (bookings.value as any)?.bookings ?? []
       const approved = list.some((b: any) => b.status === 'APPROVED')
@@ -374,10 +384,40 @@ function getGreeting() {
 
 const payNowLoading = ref(false)
 
+// ── Payment modal state ────────────────────────────────────────────────────
+const showPayModal   = ref(false)
+const payModalAmount = ref(0)
+const payMethod      = ref<'choose' | 'paypal' | 'cash'>('choose')
+const cashRefNo      = ref('')
+const cashLoading    = ref(false)
+const cashError      = ref('')
+const paySuccess     = ref('')
+
+function openPayModal(amount: number) {
+  payModalAmount.value = amount
+  payMethod.value      = 'choose'
+  cashRefNo.value      = ''
+  cashError.value      = ''
+  paySuccess.value     = ''
+  showPayModal.value   = true
+}
+
+function closePayModal() {
+  showPayModal.value = false
+  cashError.value    = ''
+  paySuccess.value   = ''
+}
+
+// Called by PaymentsCard @pay-now or by "Pay rent" button
 async function handlePayNow(amount: number) {
+  openPayModal(amount)
+}
+
+// ── PayPal path ────────────────────────────────────────────────────────────
+async function handlePaypalPay() {
   if (payNowLoading.value) return
   if (!lease.value || !tenant.value) {
-    alert('Lease or tenant data not loaded yet.')
+    cashError.value = 'Lease or tenant data not loaded yet.'
     return
   }
   const now = new Date()
@@ -389,7 +429,7 @@ async function handlePayNow(amount: number) {
       tenant_id:    String(tenant.value.id),
       lease_id:     String(lease.value.id),
       room_id:      String(lease.value.room_id),
-      amount,
+      amount:       payModalAmount.value,
       type:         'RENT',
       period_start: periodStart,
       period_end:   periodEnd,
@@ -397,12 +437,47 @@ async function handlePayNow(amount: number) {
     if (result?.approval_url) {
       window.location.href = result.approval_url
     } else {
-      alert('Payment initiated but no redirect URL returned.')
+      cashError.value = 'Payment initiated but no redirect URL returned.'
     }
   } catch (e: any) {
-    alert(`Payment initiation failed: ${e?.response?.data?.message ?? e.message ?? 'Unknown error'}`)
+    cashError.value = e?.response?.data?.message ?? e.message ?? 'Payment initiation failed.'
   } finally {
     payNowLoading.value = false
+  }
+}
+
+// ── Cash path ──────────────────────────────────────────────────────────────
+async function handleCashPay() {
+  if (cashLoading.value) return
+  if (!lease.value || !tenant.value) {
+    cashError.value = 'Lease or tenant data not loaded yet.'
+    return
+  }
+  cashError.value = ''
+  cashLoading.value = true
+  const now = new Date()
+  const periodStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
+  const periodEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString()
+  try {
+    await recordCashPayment({
+      tenant_id:    String(tenant.value.id),
+      lease_id:     String(lease.value.id),
+      room_id:      String(lease.value.room_id),
+      amount:       payModalAmount.value,
+      type:         'RENT',
+      method:       'CASH',
+      reference_no: cashRefNo.value.trim() || undefined,
+      period_start: periodStart,
+      period_end:   periodEnd,
+    })
+    paySuccess.value = 'Cash payment recorded! Your manager will confirm it shortly.'
+    // Refresh payments list
+    const updated = await getPayments()
+    payments.value = updated
+  } catch (e: any) {
+    cashError.value = e?.response?.data?.detail ?? e?.response?.data?.message ?? e.message ?? 'Failed to record payment.'
+  } finally {
+    cashLoading.value = false
   }
 }
 
@@ -451,10 +526,148 @@ async function handleOpenMessage(id: number) {
   if (!msg) return
   scrollTo('messages')
   if (msg.threadId) {
+    openThread(msg.threadId)
     markThreadRead(msg.threadId).then(() => {
-      getMessages().then(data => { messages.value = data }).catch(() => {})
+      refreshMessages()
     }).catch(() => {})
   }
+}
+
+// ── Messaging state ────────────────────────────────────────────────────────
+
+// Derive manager user_id from any MANAGEMENT_TO_TENANT message
+const managerId = computed<string>(() => {
+  const mgmtMsg = messages.value.find((m: any) => m.direction === 'MANAGEMENT_TO_TENANT')
+  return mgmtMsg ? mgmtMsg.sender_id : ''
+})
+
+// Group messages by thread, show latest per thread
+const inboxThreads = computed(() => {
+  const threadMap: Record<string, any> = {}
+  for (const m of messages.value) {
+    const tid = m.thread_id ?? m.id
+    if (!threadMap[tid] || new Date(m.created_at) > new Date(threadMap[tid].created_at)) {
+      threadMap[tid] = m
+    }
+  }
+  return Object.values(threadMap).sort(
+    (a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  )
+})
+
+// ── Compose modal ──────────────────────────────────────────────────────────
+const showComposeModal  = ref(false)
+const composeSubject    = ref('')
+const composeBody       = ref('')
+const composeLoading    = ref(false)
+const composeError      = ref('')
+const composeSuccess    = ref('')
+
+function openCompose() {
+  composeSubject.value = ''
+  composeBody.value    = ''
+  composeError.value   = ''
+  composeSuccess.value = ''
+  showComposeModal.value = true
+}
+
+function closeCompose() {
+  showComposeModal.value = false
+}
+
+async function submitCompose() {
+  if (!composeBody.value.trim()) { composeError.value = 'Message cannot be empty.'; return }
+  if (!tenant.value?.id) { composeError.value = 'Tenant data not loaded.'; return }
+  if (!managerId.value) { composeError.value = 'No management contact found. Please wait for management to message you first.'; return }
+  composeError.value   = ''
+  composeLoading.value = true
+  try {
+    await sendMessage({
+      receiver_id: managerId.value,
+      tenant_id:   String(tenant.value.id),
+      body:        composeBody.value.trim(),
+      subject:     composeSubject.value.trim() || undefined,
+      direction:   'TENANT_TO_MANAGEMENT',
+    })
+    composeSuccess.value = 'Message sent to management!'
+    await refreshMessages()
+  } catch (e: any) {
+    composeError.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to send message.'
+  } finally {
+    composeLoading.value = false
+  }
+}
+
+// ── Thread view modal ──────────────────────────────────────────────────────
+const showThreadModal  = ref(false)
+const activeThread     = ref<any>(null)
+const threadMsgs       = ref<any[]>([])
+const threadLoading    = ref(false)
+const replyBody        = ref('')
+const replyLoading     = ref(false)
+const replyError       = ref('')
+const replySuccess     = ref('')
+
+async function openThread(threadId: string) {
+  showThreadModal.value = true
+  threadLoading.value   = true
+  replyBody.value       = ''
+  replyError.value      = ''
+  replySuccess.value    = ''
+  try {
+    const data = await getThread(threadId)
+    activeThread.value = data
+    threadMsgs.value   = data.messages ?? []
+    // mark as read
+    if (tenant.value?.user_id) {
+      markThreadRead(threadId).catch(() => {})
+    }
+  } catch (e: any) {
+    replyError.value = 'Failed to load conversation.'
+  } finally {
+    threadLoading.value = false
+  }
+}
+
+function closeThread() {
+  showThreadModal.value = false
+  activeThread.value    = null
+  threadMsgs.value      = []
+}
+
+async function submitReply() {
+  if (!replyBody.value.trim()) { replyError.value = 'Reply cannot be empty.'; return }
+  if (!tenant.value?.id || !managerId.value) { replyError.value = 'Cannot send reply.'; return }
+  replyError.value   = ''
+  replyLoading.value = true
+  try {
+    await sendMessage({
+      receiver_id: managerId.value,
+      tenant_id:   String(tenant.value.id),
+      body:        replyBody.value.trim(),
+      direction:   'TENANT_TO_MANAGEMENT',
+      thread_id:   activeThread.value?.thread_id,
+    })
+    replySuccess.value = 'Reply sent!'
+    replyBody.value    = ''
+    // Refresh thread
+    const data = await getThread(activeThread.value.thread_id)
+    threadMsgs.value   = data.messages ?? []
+    await refreshMessages()
+  } catch (e: any) {
+    replyError.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to send reply.'
+  } finally {
+    replyLoading.value = false
+  }
+}
+
+async function refreshMessages() {
+  if (!tenant.value?.id) return
+  try {
+    const all = await getTenantMessages(String(tenant.value.id))
+    messages.value = all
+    unreadCount.value = all.filter((m: any) => m.status === 'UNREAD' && m.direction === 'MANAGEMENT_TO_TENANT').length
+  } catch { /* silent */ }
 }
 
 function handleLogout() {
@@ -736,6 +949,9 @@ onUnmounted(() => {
                       <span class="empty-card__viewall" @click="scrollTo('payments')">View all</span>
                     </div>
                     <p class="empty-card__msg">No payment records.</p>
+                    <button v-if="lease" class="btn-pay-rent" @click="openPayModal(lease.monthly_rate ?? 0)">
+                      Pay {{ new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) }} rent — ₱{{ (lease.monthly_rate ?? 0).toLocaleString() }}
+                    </button>
                   </div>
                 </div>
                 <!-- Maintenance -->
@@ -762,7 +978,15 @@ onUnmounted(() => {
             <main class="content">
               <section class="section--full">
                 <PaymentsCard v-if="paymentsForCard.length" :payments="paymentsForCard" :pay-loading="payNowLoading" @pay-now="handlePayNow" @view-all="scrollTo('payments')" />
-                <div v-else class="empty-section">No payment records found.</div>
+                <div v-else class="empty-card">
+                  <div class="empty-card__header">
+                    <span class="empty-card__title">Payments</span>
+                  </div>
+                  <p class="empty-card__msg">No payment records yet.</p>
+                  <button v-if="lease" class="btn-pay-rent" @click="openPayModal(lease.monthly_rate ?? 0)">
+                    Pay {{ new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) }} rent — ₱{{ (lease.monthly_rate ?? 0).toLocaleString() }}
+                  </button>
+                </div>
               </section>
             </main>
           </div>
@@ -780,8 +1004,47 @@ onUnmounted(() => {
           <div v-show="activeSection === 'messages'" id="messages">
             <main class="content">
               <section class="section--full">
-                <MessagesCard v-if="messagesForCard.length" :messages="messagesForCard" @open-message="handleOpenMessage" />
-                <div v-else class="empty-section">No messages yet.</div>
+                <div class="msg-inbox-card">
+                  <div class="msg-inbox-header">
+                    <span class="msg-inbox-title">Messages from management</span>
+                    <button class="btn-compose" @click="openCompose">✏️ New message</button>
+                  </div>
+
+                  <!-- Thread list -->
+                  <div v-if="inboxThreads.length" class="msg-thread-list">
+                    <div
+                      v-for="m in inboxThreads"
+                      :key="m.thread_id ?? m.id"
+                      class="msg-thread-item"
+                      :class="{ 'msg-thread-item--unread': m.status === 'UNREAD' && m.direction === 'MANAGEMENT_TO_TENANT' }"
+                      @click="openThread(m.thread_id ?? m.id)"
+                    >
+                      <div class="msg-thread-avatar">
+                        {{ m.direction === 'MANAGEMENT_TO_TENANT' ? 'RE' : 'Me' }}
+                      </div>
+                      <div class="msg-thread-body">
+                        <div class="msg-thread-top">
+                          <span class="msg-thread-sender">
+                            {{ m.direction === 'MANAGEMENT_TO_TENANT' ? (m.sender_name ?? 'ResidEase Admin') : 'You' }}
+                          </span>
+                          <span class="msg-thread-time">
+                            {{ new Date(m.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) }}
+                          </span>
+                        </div>
+                        <div v-if="m.subject" class="msg-thread-subject">{{ m.subject }}</div>
+                        <div class="msg-thread-preview">{{ m.body }}</div>
+                      </div>
+                      <span v-if="m.status === 'UNREAD' && m.direction === 'MANAGEMENT_TO_TENANT'" class="msg-unread-dot"></span>
+                    </div>
+                  </div>
+
+                  <!-- Empty state -->
+                  <div v-else class="msg-empty">
+                    <div style="font-size:36px;margin-bottom:8px">💬</div>
+                    <p>No messages yet.</p>
+                    <button class="btn-compose-empty" @click="openCompose">Send a message to management</button>
+                  </div>
+                </div>
               </section>
             </main>
           </div>
@@ -993,6 +1256,152 @@ onUnmounted(() => {
               Just Logout
             </button>
           </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- ── Compose Message Modal ──────────────────────────────────────────── -->
+    <Teleport to="body">
+      <div v-if="showComposeModal" class="modal-overlay" @click.self="closeCompose">
+        <div class="modal-card" style="max-width:480px">
+          <button class="modal-close" @click="closeCompose">✕</button>
+          <template v-if="!composeSuccess">
+            <div class="modal-header">
+              <h2>New Message</h2>
+              <p class="modal-sub">Send a message to management</p>
+            </div>
+            <div class="field">
+              <label>Subject <span style="color:#9ca3af;font-weight:400">(optional)</span></label>
+              <input v-model="composeSubject" type="text" class="input" placeholder="e.g. Lease inquiry" />
+            </div>
+            <div class="field">
+              <label>Message</label>
+              <textarea v-model="composeBody" rows="5" class="input" placeholder="Write your message here…" style="resize:vertical"></textarea>
+            </div>
+            <p v-if="composeError" class="msg error">{{ composeError }}</p>
+            <button class="btn-primary" :disabled="composeLoading" @click="submitCompose">
+              {{ composeLoading ? 'Sending…' : '📨 Send Message' }}
+            </button>
+          </template>
+          <template v-else>
+            <div class="success-state">
+              <div class="success-icon">✅</div>
+              <h2>Message Sent!</h2>
+              <p>{{ composeSuccess }}</p>
+              <button class="btn-close" @click="closeCompose">Close</button>
+            </div>
+          </template>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- ── Thread View Modal ───────────────────────────────────────────────── -->
+    <Teleport to="body">
+      <div v-if="showThreadModal" class="modal-overlay" @click.self="closeThread">
+        <div class="modal-card" style="max-width:520px">
+          <button class="modal-close" @click="closeThread">✕</button>
+          <div class="modal-header">
+            <h2>Conversation</h2>
+            <p class="modal-sub">{{ activeThread?.messages?.[0]?.subject ?? 'Direct message' }}</p>
+          </div>
+
+          <div v-if="threadLoading" style="text-align:center;padding:20px;color:#9ca3af">Loading…</div>
+
+          <div v-else class="thread-msgs">
+            <div
+              v-for="(m, i) in threadMsgs"
+              :key="i"
+              class="thread-bubble"
+              :class="m.direction === 'TENANT_TO_MANAGEMENT' ? 'thread-bubble--mine' : 'thread-bubble--theirs'"
+            >
+              <div class="thread-bubble-name">
+                {{ m.direction === 'TENANT_TO_MANAGEMENT' ? 'You' : (m.sender_name ?? 'Management') }}
+              </div>
+              <div class="thread-bubble-body">{{ m.body }}</div>
+              <div class="thread-bubble-time">
+                {{ new Date(m.created_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }}
+              </div>
+            </div>
+          </div>
+
+          <!-- Reply box -->
+          <div class="thread-reply" v-if="!threadLoading">
+            <textarea v-model="replyBody" rows="3" class="input" placeholder="Write a reply…" style="resize:none"></textarea>
+            <p v-if="replyError" class="msg error" style="margin-top:6px">{{ replyError }}</p>
+            <p v-if="replySuccess" class="msg" style="background:#dcfce7;color:#166534;margin-top:6px">{{ replySuccess }}</p>
+            <button class="btn-primary" :disabled="replyLoading" @click="submitReply" style="margin-top:8px">
+              {{ replyLoading ? 'Sending…' : '↩ Reply' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+
+    <Teleport to="body">
+      <div v-if="showPayModal" class="modal-overlay" @click.self="closePayModal">
+        <div class="modal-card" style="max-width: 420px;">
+          <button class="modal-close" @click="closePayModal">✕</button>
+
+          <!-- SUCCESS STATE -->
+          <template v-if="paySuccess">
+            <div class="success-state">
+              <div class="success-icon">✅</div>
+              <h2>Payment Recorded!</h2>
+              <p>{{ paySuccess }}</p>
+              <button class="btn-close" @click="closePayModal">Close</button>
+            </div>
+          </template>
+
+          <!-- CHOOSE METHOD -->
+          <template v-else-if="payMethod === 'choose'">
+            <div class="modal-header">
+              <h2>Pay Rent</h2>
+              <p class="modal-sub">Amount: <strong>₱{{ payModalAmount.toLocaleString() }}</strong> — Choose how you'd like to pay</p>
+            </div>
+            <div class="pay-method-grid">
+              <button class="pay-method-btn" @click="payMethod = 'paypal'">
+                <span class="pay-method-icon">🌐</span>
+                <span class="pay-method-label">PayPal</span>
+                <span class="pay-method-hint">Secure online payment</span>
+              </button>
+              <button class="pay-method-btn" @click="payMethod = 'cash'">
+                <span class="pay-method-icon">💵</span>
+                <span class="pay-method-label">Cash / GCash</span>
+                <span class="pay-method-hint">Record manual payment</span>
+              </button>
+            </div>
+          </template>
+
+          <!-- PAYPAL CONFIRM -->
+          <template v-else-if="payMethod === 'paypal'">
+            <div class="modal-header">
+              <h2>Pay via PayPal</h2>
+              <p class="modal-sub">You'll be redirected to PayPal to complete the payment of <strong>₱{{ payModalAmount.toLocaleString() }}</strong>.</p>
+            </div>
+            <p v-if="cashError" class="msg error">{{ cashError }}</p>
+            <button class="btn-primary" :disabled="payNowLoading" @click="handlePaypalPay">
+              {{ payNowLoading ? 'Redirecting…' : '🌐 Continue to PayPal' }}
+            </button>
+            <button class="btn-back" @click="payMethod = 'choose'">← Back</button>
+          </template>
+
+          <!-- CASH FORM -->
+          <template v-else-if="payMethod === 'cash'">
+            <div class="modal-header">
+              <h2>Cash / Manual Payment</h2>
+              <p class="modal-sub">Recording payment of <strong>₱{{ payModalAmount.toLocaleString() }}</strong>. Your manager will confirm it.</p>
+            </div>
+            <div class="field">
+              <label>Reference No. <span style="color:#9ca3af;font-weight:400">(optional — GCash ref, bank ref, etc.)</span></label>
+              <input v-model="cashRefNo" type="text" class="input" placeholder="e.g. GC-20260511-XYZ" />
+            </div>
+            <p v-if="cashError" class="msg error">{{ cashError }}</p>
+            <button class="btn-primary" :disabled="cashLoading" @click="handleCashPay">
+              {{ cashLoading ? 'Recording…' : '💵 Record Cash Payment' }}
+            </button>
+            <button class="btn-back" @click="payMethod = 'choose'">← Back</button>
+          </template>
         </div>
       </div>
     </Teleport>
@@ -1380,6 +1789,104 @@ onUnmounted(() => {
 .success-icon  { font-size: 48px; margin-bottom: 16px; }
 .success-state h2 { font-size: 22px; font-weight: 800; color: #1f2937; margin-bottom: 8px; }
 .success-state p  { color: #6b7280; margin-bottom: 24px; }
+/* ── Messaging inbox ─────────────────────────────────────────────── */
+.msg-inbox-card {
+  background: #fff; border: 1px solid #e9e6f5; border-radius: 16px; overflow: hidden;
+}
+.msg-inbox-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid #f3f0fb;
+}
+.msg-inbox-title { font-size: 15px; font-weight: 700; color: #111827; }
+.btn-compose {
+  background: linear-gradient(90deg, #ae68fa, #f1966e); color: #fff;
+  border: none; border-radius: 999px; padding: 7px 16px;
+  font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+}
+.btn-compose:hover { opacity: .9; }
+
+.msg-thread-list { display: flex; flex-direction: column; }
+.msg-thread-item {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px 20px; border-bottom: 1px solid #f9f7ff;
+  cursor: pointer; transition: background .1s; position: relative;
+}
+.msg-thread-item:hover { background: #faf7ff; }
+.msg-thread-item--unread { background: #fdf8ff; }
+.msg-thread-avatar {
+  width: 38px; height: 38px; border-radius: 50%; flex-shrink: 0;
+  background: linear-gradient(135deg, #ae68fa, #f1966e);
+  color: #fff; font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+.msg-thread-body { flex: 1; min-width: 0; }
+.msg-thread-top { display: flex; justify-content: space-between; align-items: center; }
+.msg-thread-sender { font-size: 13px; font-weight: 700; color: #1f2937; }
+.msg-thread-time   { font-size: 11px; color: #9ca3af; }
+.msg-thread-subject { font-size: 12px; font-weight: 600; color: #4b5563; margin-top: 2px; }
+.msg-thread-preview {
+  font-size: 12px; color: #9ca3af; margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.msg-unread-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #ae68fa;
+  flex-shrink: 0; margin-top: 5px;
+}
+.msg-empty {
+  padding: 40px; text-align: center; color: #9ca3af; font-size: 14px;
+}
+.btn-compose-empty {
+  margin-top: 12px; padding: 9px 20px; border-radius: 999px; border: none;
+  background: linear-gradient(90deg, #ae68fa, #f1966e); color: #fff;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+}
+
+/* ── Thread bubble view ──────────────────────────────────────────── */
+.thread-msgs {
+  max-height: 320px; overflow-y: auto; display: flex; flex-direction: column;
+  gap: 12px; padding: 4px 0 8px;
+}
+.thread-bubble {
+  max-width: 78%; display: flex; flex-direction: column; gap: 3px;
+}
+.thread-bubble--mine   { align-self: flex-end; align-items: flex-end; }
+.thread-bubble--theirs { align-self: flex-start; align-items: flex-start; }
+.thread-bubble-name  { font-size: 11px; font-weight: 600; color: #9ca3af; }
+.thread-bubble-body  {
+  padding: 10px 14px; border-radius: 16px; font-size: 13px; line-height: 1.5;
+}
+.thread-bubble--mine   .thread-bubble-body { background: linear-gradient(135deg,#ae68fa,#f1966e); color:#fff; border-bottom-right-radius: 4px; }
+.thread-bubble--theirs .thread-bubble-body { background: #f3f0fb; color: #1f2937; border-bottom-left-radius: 4px; }
+.thread-bubble-time  { font-size: 10px; color: #c4b8e8; }
+.thread-reply { border-top: 1px solid #f3f0fb; padding-top: 14px; margin-top: 4px; }
+
+.btn-pay-rent {
+  width: 100%; padding: 12px; border-radius: 999px; border: none;
+  background: linear-gradient(90deg, #ae68fa, #f1966e);
+  color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+  transition: opacity .15s; margin-top: 8px;
+}
+.btn-pay-rent:hover { opacity: .9; }
+
+.pay-method-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px;
+}
+.pay-method-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 20px 12px; border-radius: 16px; border: 2px solid #e0ddf7;
+  background: #faf7ff; cursor: pointer; transition: border-color .15s, background .15s;
+}
+.pay-method-btn:hover { border-color: #ae68fa; background: #f3eeff; }
+.pay-method-icon  { font-size: 28px; }
+.pay-method-label { font-size: 14px; font-weight: 700; color: #1f2937; }
+.pay-method-hint  { font-size: 11px; color: #9ca3af; }
+
+.btn-back {
+  width: 100%; padding: 10px; border-radius: 999px; border: 1px solid #e0ddf7;
+  background: #fff; color: #6b7280; font-size: 14px; font-weight: 500;
+  cursor: pointer; margin-top: 4px; transition: background .15s;
+}
+.btn-back:hover { background: #f9f7ff; }
 .btn-close {
   padding: 8px 24px; border-radius: 24px;
   background: linear-gradient(90deg, #ae68fa, #f1966e); color: #fff; border: none;

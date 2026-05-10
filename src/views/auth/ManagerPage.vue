@@ -51,6 +51,7 @@ const approvedBookings   = ref<BookingItem[]>([])
 const viewingBooking     = ref<BookingItem | null>(null)
 const confirmRejectId    = ref('')
 const rejectReason       = ref('')
+const bookingActionError = ref('')   // inline error shown inside the booking modal
 const tenants        = ref<ExtendedTenantResponse[]>([])
 const tenantStats    = ref<TenantStats | null>(null)
 const paymentStats   = ref<PaymentStats | null>(null)
@@ -158,8 +159,9 @@ async function removeRoom(id: string, roomNumber: string, roomStatus: string) {
       const linkedBooking = approvedBookings.value.find(b => b.room_id === id)
 
       if (linkedTenant?.id) {
-        // Full cleanup via the unassign endpoint
-        await managerService.unassignTenant(linkedTenant.id)
+        // Unassign tenant via the tenant-level endpoint (sets status MOVED_OUT, frees the room)
+        const moveOutDate = new Date().toISOString()
+        await tenantService.unassignRoom(linkedTenant.id, moveOutDate)
       } else if (linkedBooking) {
         // Tenant profile not created yet — just reject the booking + free room
         await bookingService.review(linkedBooking.id, {
@@ -174,7 +176,7 @@ async function removeRoom(id: string, roomNumber: string, roomStatus: string) {
 
       await loadManagerData()
     } catch (e: any) {
-      error.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to unassign tenant.'
+      error.value = extractError(e, 'Failed to unassign tenant.')
     }
     return
   }
@@ -189,7 +191,7 @@ async function removeRoom(id: string, roomNumber: string, roomStatus: string) {
     if (status === 403) {
       error.value = `Only admins can permanently delete rooms. Use "Set Maintenance" to deactivate room ${roomNumber}.`
     } else {
-      error.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to remove room.'
+      error.value = extractError(e, 'Failed to remove room.')
     }
   }
 }
@@ -199,16 +201,55 @@ async function setRoomMaintenance(id: string) {
     await roomService.updateStatus(id, 'MAINTENANCE')
     await loadManagerData()
   } catch (e: any) {
-    error.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to update room status.'
+    error.value = extractError(e, 'Failed to update room status.')
   }
 }
 
 async function setRoomVacant(id: string) {
+  // Belt-and-suspenders: if the room still has occupants (e.g. field name mismatch
+  // means the template guard didn't hide this button), redirect to the full unassign
+  // flow instead of hitting the backend with a guaranteed 400.
+  const room = rooms.value.find(r => r.id === id)
+  console.log('[setRoomVacant] room data:', JSON.stringify(room))
+  const occupants = room?.current_occupants ?? (room as any)?.occupant_count ?? (room as any)?.occupied ?? 0
+  if (Number(occupants) > 0) {
+    await removeRoom(id, room?.room_number ?? id, 'OCCUPIED')
+    return
+  }
   try {
     await roomService.updateStatus(id, 'VACANT')
     await loadManagerData()
   } catch (e: any) {
-    error.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to set room as vacant.'
+    error.value = extractError(e, 'Failed to set room as vacant.')
+  }
+}
+
+// ── TENANTS: unassign handler (extracted to avoid window in template) ─────────
+async function handleUnassignTenant(id: string, fullName: string) {
+  const tenant = tenants.value.find(x => x.id === id)
+
+  if (tenant?.room_id) {
+    // Tenant has a known room — delegate to removeRoom which handles all cleanup
+    await removeRoom(tenant.room_id, tenant.room_number ?? 'room', 'OCCUPIED')
+  } else {
+    // No room_id on the tenant record — try to find the room by scanning rooms list
+    const linkedRoom = rooms.value.find(r => r.status === 'OCCUPIED' &&
+      tenants.value.find(t => t.id === id && t.room_id === r.id))
+
+    if (linkedRoom) {
+      await removeRoom(linkedRoom.id, linkedRoom.room_number, 'OCCUPIED')
+      return
+    }
+
+    if (!window.confirm(`Unassign ${fullName} from their room?`)) return
+
+    try {
+      const moveOutDate = new Date().toISOString()
+      await tenantService.unassignRoom(id, moveOutDate)
+      await loadManagerData()
+    } catch (e: any) {
+      error.value = extractError(e, 'Failed to unassign tenant.')
+    }
   }
 }
 
@@ -353,6 +394,36 @@ function activityDotClass(type: string) {
   return 'dot-green'
 }
 
+// ── Safely extract a readable string from any axios/fetch error ───────────────
+// FastAPI 422 responses return `detail` as an array like [{loc, msg, type}].
+// extractError: for axios errors (e.response.data.detail)
+// extractFetchError: for raw fetch() responses (json.detail)
+function extractError(e: any, fallback = 'An error occurred.'): string {
+  const detail = e?.response?.data?.detail
+  if (Array.isArray(detail)) {
+    return detail.map((d: any) => {
+      const loc = Array.isArray(d?.loc) ? d.loc.filter((l: any) => l !== 'body').join(' -> ') : ''
+      const msg = d?.msg ?? JSON.stringify(d)
+      return loc ? `"${loc}": ${msg}` : msg
+    }).join('; ')
+  }
+  if (typeof detail === 'string' && detail) return detail
+  return e?.message ?? fallback
+}
+
+function extractFetchError(json: any, fallback = 'An error occurred.'): string {
+  const detail = json?.detail
+  if (Array.isArray(detail)) {
+    return detail.map((d: any) => {
+      const loc = Array.isArray(d?.loc) ? d.loc.filter((l: any) => l !== 'body').join(' -> ') : ''
+      const msg = d?.msg ?? JSON.stringify(d)
+      return loc ? `"${loc}": ${msg}` : msg
+    }).join('; ')
+  }
+  if (typeof detail === 'string' && detail) return detail
+  return json?.message ?? fallback
+}
+
 async function loadManagerData() {
   loading.value = true
   error.value   = ''
@@ -395,7 +466,7 @@ async function loadManagerData() {
 }
 
 function viewBooking(b: BookingItem) { viewingBooking.value = b }
-function closeBookingModal() { viewingBooking.value = null; confirmRejectId.value = ''; rejectReason.value = '' }
+function closeBookingModal() { viewingBooking.value = null; confirmRejectId.value = ''; rejectReason.value = ''; bookingActionError.value = '' }
 
 // ── APPROVE booking ───────────────────────────────────────────────────────────
 async function approveBooking(id: string) {
@@ -404,7 +475,7 @@ async function approveBooking(id: string) {
     closeBookingModal()
     await loadManagerData()
   } catch (e: any) {
-    error.value = e?.message ?? 'Failed to approve booking.'
+    bookingActionError.value = extractError(e, 'Failed to approve booking.')
   }
 }
 
@@ -416,11 +487,17 @@ async function rejectBooking(id: string) {
     return
   }
 
+  // Reason is now required
+  if (!rejectReason.value.trim()) {
+    bookingActionError.value = 'A rejection reason is required before rejecting.'
+    return
+  }
+
   try {
     // 1. Reject the booking
     await bookingService.review(id, {
       status: 'REJECTED',
-      review_notes: rejectReason.value || 'Rejected by manager'
+      review_notes: rejectReason.value.trim()
     })
 
     // 2. Find the booking to get its room_id and user_id
@@ -435,10 +512,10 @@ async function rejectBooking(id: string) {
         }
       }
 
-      // 4. If a tenant profile was already created for this user, delete it too
+      // 4. If a tenant profile was already created for this user, unassign their room
       const linkedTenant = tenants.value.find(t => t.user_id === rejected.user_id)
-      if (linkedTenant?.id) {
-        await managerService.unassignTenant(linkedTenant.id)
+      if (linkedTenant?.id && linkedTenant.room_id) {
+        await tenantService.unassignRoom(linkedTenant.id, new Date().toISOString())
       }
     }
 
@@ -452,31 +529,75 @@ async function rejectBooking(id: string) {
     closeBookingModal()
     await loadManagerData()
   } catch (e: any) {
-    error.value = e?.message ?? 'Failed to reject booking.'
+    bookingActionError.value = extractError(e, 'Failed to reject booking.')
   }
 }
 
-// ── CONFIRM reserved tenant → mark as OCCUPIED ───────────────────────────────
+// ── CONFIRM reserved tenant → create a lease (backend handles OCCUPIED) ───────
+// The backend forbids directly setting room status to OCCUPIED.
+// The correct path is POST /api/leases — the backend marks the room OCCUPIED
+// automatically when a lease is created for it.
 async function confirmTenant(bookingId: string, fullName: string) {
-  if (!window.confirm(`Confirm ${fullName} as an active occupant?`)) return
+  if (!window.confirm(`Confirm ${fullName} as an active occupant? This will create an active lease for them.`)) return
   try {
-    await bookingService.review(bookingId, {
-      status: 'CONFIRMED',
-      review_notes: 'Confirmed as occupant by manager'
+    const booking = approvedBookings.value.find(b => b.id === bookingId)
+    if (!booking?.room_id) throw new Error('Booking has no linked room — reload and try again.')
+
+    // A tenant profile must exist before we can create a lease.
+    const tenant = tenants.value.find(t => t.user_id === booking.user_id)
+    if (!tenant?.id) throw new Error(
+      `No tenant profile found for ${fullName}. They may need to complete account setup first.`
+    )
+
+    const room  = rooms.value.find(r => r.id === booking.room_id)
+    const today = new Date().toISOString().split('T')[0]
+    const oneYearLater = new Date(new Date().setFullYear(new Date().getFullYear() + 1))
+      .toISOString().split('T')[0]
+
+    // If the room has no rate set, ask the manager before hitting the backend
+    let monthlyRate = room?.monthly_rent ?? 0
+    if (monthlyRate <= 0) {
+      const input = window.prompt(
+        `Room ${room?.room_number ?? booking.room_id} has no monthly rate set.\nEnter the monthly rate (₱):`,
+        ''
+      )
+      if (input === null) return // manager cancelled
+      monthlyRate = parseFloat(input)
+      if (isNaN(monthlyRate) || monthlyRate <= 0) {
+        error.value = 'A valid monthly rate greater than ₱0 is required to create a lease.'
+        return
+      }
+    }
+
+    // Create the lease — backend will set room status → OCCUPIED automatically
+    const res = await fetch('/api/leases/', {
+      method:  'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization:  `Bearer ${auth.token}`,
+      },
+      body: JSON.stringify({
+        tenant_id:    tenant.id,
+        room_id:      booking.room_id,
+        start_date:   today,
+        end_date:     oneYearLater,
+        monthly_rate: monthlyRate,
+      }),
     })
 
-    // Optimistically update room status in local state
-    const booking = approvedBookings.value.find(b => b.id === bookingId)
-    if (booking) {
-      const room = rooms.value.find(r => r.id === booking.room_id)
-      if (room) room.status = 'OCCUPIED'
-      // Move booking out of reserved into active tenants display
-      approvedBookings.value = approvedBookings.value.filter(b => b.id !== bookingId)
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}))
+      console.error('[confirmTenant] lease 422 detail:', JSON.stringify(json?.detail, null, 2))
+      throw new Error(extractFetchError(json, 'Failed to create lease.'))
     }
+
+    // Optimistically update local state
+    if (room) room.status = 'OCCUPIED'
+    approvedBookings.value = approvedBookings.value.filter(b => b.id !== bookingId)
 
     await loadManagerData()
   } catch (e: any) {
-    error.value = e?.response?.data?.detail ?? e?.message ?? 'Failed to confirm tenant.'
+    error.value = extractError(e, 'Failed to confirm tenant.')
   }
 }
 
@@ -822,11 +943,7 @@ async function confirmPayment(paymentId: string) {
                       v-else
                       class="action-btn unassign"
                       title="Unassign tenant — frees room and removes records"
-                      @click="() => {
-                        const tenant = tenants.find(x => x.id === t.id)
-                        if (tenant?.room_id) removeRoom(tenant.room_id, tenant.room_number ?? 'room', 'OCCUPIED')
-                        else if (window.confirm(`Remove ${t.full_name}'s profile?`)) managerService.unassignTenant(t.id).then(loadManagerData)
-                      }"
+                      @click="handleUnassignTenant(t.id, t.full_name)"
                     >
                       Unassign
                     </button>
@@ -891,12 +1008,20 @@ async function confirmPayment(paymentId: string) {
                   <td>{{ r.current_occupants ?? 0 }} / {{ r.max_occupants ?? '—' }}</td>
                   <td>{{ formatMoney(r.monthly_rent) }}</td>
                   <td class="td-actions">
+                    <!-- MAINTENANCE + no occupants → safe to set vacant directly -->
                     <button
-                      v-if="r.status === 'MAINTENANCE'"
+                      v-if="r.status === 'MAINTENANCE' && (r.current_occupants ?? 0) === 0"
                       class="action-btn approve"
                       title="Mark room as Vacant"
                       @click="setRoomVacant(r.id)"
                     >Set Vacant</button>
+                    <!-- MAINTENANCE + active occupants → must unassign + free in one step -->
+                    <button
+                      v-if="r.status === 'MAINTENANCE' && (r.current_occupants ?? 0) > 0"
+                      class="action-btn unassign"
+                      title="Terminate lease, unassign tenant, and free room"
+                      @click="removeRoom(r.id, r.room_number, 'OCCUPIED')"
+                    >Unassign & Vacate</button>
                     <button
                       v-if="r.status !== 'MAINTENANCE'"
                       class="action-btn outline"
@@ -1166,13 +1291,22 @@ async function confirmPayment(paymentId: string) {
 
           <!-- Approve / Reject actions — only shown for PENDING bookings -->
           <template v-if="viewingBooking.status === 'PENDING'">
+            <!-- Inline error (covers both approve failures and reject validation) -->
+            <div v-if="bookingActionError"
+                 style="margin-top:10px;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:9px;color:#991b1b;font-size:12.5px;display:flex;justify-content:space-between;align-items:center">
+              {{ bookingActionError }}
+              <button @click="bookingActionError = ''" style="background:none;border:none;cursor:pointer;color:#991b1b;font-size:14px;line-height:1">✕</button>
+            </div>
+            <!-- Rejection reason — shown on first Reject click, required before confirming -->
             <div v-if="confirmRejectId === viewingBooking.id" style="margin-top:8px">
-              <label style="font-size:12px;color:#6b7280;font-weight:500">Rejection reason (optional)</label>
-              <input v-model="rejectReason" type="text" placeholder="Enter reason"
-                     style="margin-top:4px;width:100%;padding:8px 14px;border-radius:12px;border:1px solid #e0ddf7;font-size:13px;box-sizing:border-box;outline:none" />
+              <label style="font-size:12px;font-weight:600;color:#991b1b">
+                Rejection reason <span style="color:#ef4444">*</span> <span style="font-weight:400;color:#6b7280">(required)</span>
+              </label>
+              <input v-model="rejectReason" type="text" placeholder="Enter a reason for rejection…"
+                     style="margin-top:4px;width:100%;padding:8px 14px;border-radius:12px;border:1.5px solid #fca5a5;font-size:13px;box-sizing:border-box;outline:none;background:#fff" />
             </div>
             <div style="display:flex;gap:10px;margin-top:12px">
-              <button class="vbtn-approve" @click="approveBooking(viewingBooking.id)">&#10003; Approve</button>
+              <button class="vbtn-approve" @click="bookingActionError = ''; approveBooking(viewingBooking.id)">&#10003; Approve</button>
               <button class="vbtn-reject"  @click="rejectBooking(viewingBooking.id)">
                 {{ confirmRejectId === viewingBooking.id ? 'Confirm Reject' : '&#10007; Reject' }}
               </button>
