@@ -1,34 +1,44 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import BaseCard from './Card.vue'
 
 const BaseCardComponent = BaseCard as any
 
 export interface Payment {
   id: number
-  label: string        // e.g. 'April 2026 rent'
-  dueOrPaidDate: string // e.g. 'Due Apr 5, 2026' or 'Paid Mar 3, 2026'
-  amount: number
-  status: 'Paid' | 'Unpaid'
+  rawId?: any
+  label: any
+  dueOrPaidDate: string
+  amount: any
+  status: 'Paid' | 'Unpaid' | string
+  method?: any
+  receiptNo?: any
 }
 
 const props = defineProps<{
   payments: Payment[]
-  unpaidAmount?: number  // if there is a current unpaid amount for the CTA button
+  payLoading?: boolean
 }>()
 
 const emit = defineEmits<{
   payNow: [amount: number]
+  viewAll: []
 }>()
 
 function formatCurrency(amount: number) {
   return `₱${amount.toLocaleString('en-PH', { minimumFractionDigits: 0 })}`
 }
 
-const pendingPayment = props.payments.find(p => p.status === 'Unpaid')
+const METHOD_LABEL: Record<string, string> = {
+  CASH: 'Cash', BANK_TRANSFER: 'Bank', GCASH: 'GCash',
+  PAYMAYA: 'PayMaya', CARD: 'Card', PAYPAL: 'PayPal', OTHER: 'Other',
+}
+
+const pendingPayment = computed(() => props.payments.find(p => p.status === 'Unpaid'))
 </script>
 
 <template>
-  <BaseCardComponent title="Payments" link-text="View all" link-href="#">
+  <BaseCardComponent title="Payments" link-text="View all" @link-click="emit('viewAll')">
     <div
       v-for="payment in payments"
       :key="payment.id"
@@ -63,9 +73,10 @@ const pendingPayment = props.payments.find(p => p.status === 'Unpaid')
       <button
         v-if="pendingPayment"
         class="pay-btn"
+        :disabled="payLoading"
         @click="emit('payNow', pendingPayment.amount)"
       >
-        Pay {{ pendingPayment.label }} — {{ formatCurrency(pendingPayment.amount) }}
+        {{ payLoading ? 'Redirecting to PayPal…' : `Pay ${pendingPayment.label} — ${formatCurrency(pendingPayment.amount)}` }}
       </button>
     </template>
   </BaseCardComponent>
@@ -95,13 +106,13 @@ const pendingPayment = props.payments.find(p => p.status === 'Unpaid')
 }
 
 .payment-icon--unpaid {
-  background: #fff0f0;
-  color: #e74c3c;
+  background: #ede9fe;
+  color: #7c3aed;
 }
 
 .payment-icon--paid {
-  background: #e6f9f0;
-  color: #1a8a52;
+  background: #f3f4f6;
+  color: #6b7280;
 }
 
 .payment-info {

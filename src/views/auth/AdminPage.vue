@@ -51,7 +51,10 @@ async function fetchManagerRequests() {
     const res = await managerRequestService.listAll({ status: 'PENDING', limit: 50 })
     managerRequests.value = res.requests ?? []
   } catch (e: any) {
-    error.value = e?.message ?? 'Failed to load manager requests.'
+    // Isolate this error — don't overwrite a dashboard-level error
+    // The 401 here is a managerRequestService URL/auth bug; log it without breaking the page
+    console.warn('Manager requests unavailable:', e?.message ?? e)
+    managerRequests.value = []
   }
 }
 
@@ -131,12 +134,24 @@ async function fetchAdminData() {
     if (filters.value.role !== 'all') params.role = filters.value.role
     if (filters.value.status !== 'all') params.status = filters.value.status
 
-    const [usersRes, statsRes] = await Promise.all([
+    // Use allSettled so a failing stats endpoint doesn't crash the whole dashboard
+    const [usersResult, statsResult] = await Promise.allSettled([
       adminService.listUsers(params),
       adminService.getStats(),
     ])
-    users.value = usersRes.users.map(mapUser)
-    stats.value = statsRes
+
+    if (usersResult.status === 'fulfilled') {
+      users.value = usersResult.value.users.map(mapUser)
+    } else {
+      error.value = usersResult.reason?.message ?? 'Failed to load users.'
+    }
+
+    if (statsResult.status === 'fulfilled') {
+      stats.value = statsResult.value
+    } else {
+      // Stats failure is non-fatal — dashboard still renders without them
+      console.warn('Stats unavailable:', statsResult.reason?.message)
+    }
   } catch (e: any) {
     error.value = e?.message ?? 'Failed to load admin data.'
   } finally {

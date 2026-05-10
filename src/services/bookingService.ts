@@ -3,6 +3,7 @@ import { BaseService } from './BaseService'
 export interface BookingApplyPayload {
   room_id:              string
   full_name:            string
+  last_name?:           string
   email:                string
   phone:                string
   address:              string
@@ -11,22 +12,49 @@ export interface BookingApplyPayload {
   desired_move_in_date?: string
   message?:             string
   id_document?:         string
+  date_of_birth?:       string
+  gender?:              string
+  civil_status?:        string
+  nationality?:         string
+  occupation?:          string
+  employer?:            string
+  monthly_income?:      number
+  emergency_contact_name?:         string
+  emergency_contact_phone?:        string
+  emergency_contact_relationship?: string
 }
 
 export interface BookingItem {
   id:                  string
+  user_id:             string
   room_id:             string
   room_number?:        string
   monthly_rent?:       number
   full_name:           string
+  last_name?:          string
   email:               string
   phone:               string
   address:             string
+  city?:               string
+  province?:           string
   desired_move_in_date?: string
   message?:            string
+  date_of_birth?:      string
+  gender?:             string
+  civil_status?:       string
+  nationality?:        string
+  occupation?:         string
+  employer?:           string
+  monthly_income?:     number
+  emergency_contact_name?:         string
+  emergency_contact_phone?:        string
+  emergency_contact_relationship?: string
+  id_document?:        string
   status:              'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED'
   review_notes?:       string
+  reviewed_at?:        string
   created_at:          string
+  updated_at?:         string
 }
 
 export interface ReviewBookingPayload {

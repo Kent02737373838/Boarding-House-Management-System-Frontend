@@ -5,6 +5,8 @@ defineProps<{
   linkHref?: string
 }>()
 
+const emit = defineEmits<{ linkClick: [] }>()
+
 defineSlots<{
   default(props: {}): any
   header(props: {}): any
@@ -16,7 +18,7 @@ defineSlots<{
   <div class="base-card">
     <div v-if="title || linkText" class="base-card__header">
       <h2 v-if="title" class="base-card__title">{{ title }}</h2>
-      <a v-if="linkText" :href="linkHref ?? '#'" class="base-card__link">
+      <a v-if="linkText" href="#" class="base-card__link" @click.prevent="emit('linkClick')">
         {{ linkText }}
       </a>
     </div>
