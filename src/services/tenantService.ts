@@ -63,3 +63,19 @@ export async function initiatePaypalPayment(payload: {
   const res = await axios.post('/api/payments/paypal/initiate', payload, { headers: getHeaders() })
   return unwrap(res)
 }
+
+export async function recordCashPayment(payload: {
+  tenant_id: string
+  lease_id: string
+  room_id: string
+  amount: number
+  type?: string
+  method?: string
+  reference_no?: string
+  notes?: string
+  period_start?: string
+  period_end?: string
+}): Promise<any> {
+  const res = await axios.post('/api/payments/cash', payload, { headers: getHeaders() })
+  return unwrap(res)
+}
